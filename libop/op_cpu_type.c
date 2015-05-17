@@ -432,6 +432,11 @@ static op_cpu _get_arm_cpu_type(void)
 		case 2:
 			return op_get_cpu_number("arm/xscale2");
 		}
+    } else if (vendorid == 0x51) {  /* Qualcomm */
+        switch (cpuid) {
+        case 0x4d:
+            return op_get_cpu_number("arm/armv7-krait"); /* MSM8930 */
+        }
 	}
 
 	return CPU_NO_GOOD;
