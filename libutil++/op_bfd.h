@@ -111,16 +111,11 @@ public:
 	       bool & ok);
 
 	/**
-	 * This constructor is used when processing an SPU profile
-	 * where the SPU ELF is embedded within the PPE binary.
+	 * This constructor is used when the /proc/kallsyms file is used
+	 * to get the kernel symbols.
 	 */
-	op_bfd(uint64_t spu_offset,
-	       std::string const & filename,
-	       string_filter const & symbol_filter,
-	       extra_images const & extra_images,
-	       bool & ok);
-
-	std::string get_embedding_filename() const { return embedding_filename; }
+	op_bfd(std::string const & filename,
+	       extra_images const & extra_images);
 
 	/// close an opened bfd image and free all related resources
 	~op_bfd();
@@ -229,6 +224,9 @@ private:
 	 */
 	void get_symbols(symbols_found_t & symbols);
 
+	/* functions for reading kallsyms */
+	void get_kallsym_symbols(symbols_found_t & symbols, std::ifstream& infile);
+
 	/**
 	 * Helper function for get_symbols.
 	 * Populates bfd_syms and extracts the "interesting_symbol"s.
@@ -294,12 +292,6 @@ private:
 	// mapping of section names to filepos in the original binary
 	filepos_map_t filepos_map;
 
-	/**
-	 * If spu_offset is non-zero, embedding_filename is the file containing
-	 * the embedded SPU image.
-	 */
-	std::string embedding_filename;
-
 	bool anon_obj;
 
 	/**
@@ -322,6 +314,13 @@ private:
 	 * only if the real image has no symbol info; otherwise vma_adj is set to 0.
 	 */
         bfd_vma vma_adj;
+
+        /**
+         * The file descriptor for an image file that we pass to fdopen_bfd must be kept
+         * open through the life of the op_bfd to enable proper behavior of certain
+         * BFD functions -- in particular, bfd_find_nearest_line().
+         */
+        int fd;
 
 };
 

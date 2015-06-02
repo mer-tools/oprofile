@@ -114,7 +114,8 @@ unsigned parse_extra(const char *s)
 	unsigned v, w;
 	int o;
 
-	v = 0;
+	/* This signifies that the first word of the description is unique */
+	v = EXTRA_NONE;
 	while (*s) {
 		if (isspace(*s))
 			break;
@@ -196,7 +197,12 @@ static void parse_um(struct op_unit_mask * um, char const * line)
 			if (seen_default)
 				parse_error("duplicate default: tag");
 			seen_default = 1;
-			um->default_mask = parse_hex(tagend);
+			if (0 != strncmp(tagend, "0x", 2)) {
+				um->default_mask_name = op_xstrndup(
+					tagend, valueend - tagend);
+			} else {
+				um->default_mask = parse_hex(tagend);
+			}
 		} else {
 			parse_error("invalid unit mask tag");
 		}
@@ -214,32 +220,53 @@ static void parse_um(struct op_unit_mask * um, char const * line)
 
 
 /* \t0x08 (M)odified cache state */
-/* \t0x08 extra:inv,cmask=... (M)odified cache state */
+/* \t0x08 extra:inv,cmask=... mod_cach_state (M)odified cache state */
 static void parse_um_entry(struct op_described_um * entry, char const * line)
 {
 	char const * c = line;
 
+	/* value */
 	c = skip_ws(c);
 	entry->value = parse_hex(c);
-	c = skip_nonws(c);
 
+	/* extra: */
+	c = skip_nonws(c);
 	c = skip_ws(c);
+	if (!*c)
+		goto invalid_out;
+
 	if (strisprefix(c, "extra:")) {
 		c += 6;
 		entry->extra = parse_extra(c);
+		/* include the regular umask if there are real extra bits */
+		if (entry->extra != EXTRA_NONE)
+			entry->extra |= (entry->value & UMASK_MASK) << UMASK_SHIFT;
+		/* named mask */
 		c = skip_nonws(c);
-	} else
+		c = skip_ws(c);
+		if (!*c)
+			goto invalid_out;
+
+		/* "extra:" !!ALWAYS!! followed by named mask */
+		entry->name = op_xstrndup(c, strcspn(c, " \t"));
+		c = skip_nonws(c);
+		c = skip_ws(c);
+	} else {
 		entry->extra = 0;
+	}
 
-	if (!*c)
-		parse_error("invalid unit mask entry");
+	/* desc */
+	if (!*c) {
+		/* This is a corner case where the named unit mask entry
+		 * only has one word.  This should really be fixed in the
+		 * unit_mask file */
+		entry->desc = xstrdup(entry->name);
+	} else
+		entry->desc = xstrdup(c);
+	return;
 
-	c = skip_ws(c);
-
-	if (!*c)
-		parse_error("invalid unit mask entry");
-
-	entry->desc = xstrdup(c);
+invalid_out:
+	parse_error("invalid unit mask entry");
 }
 
 
@@ -256,6 +283,7 @@ static void free_unit_mask(struct op_unit_mask * um)
 {
 	list_del(&um->um_next);
 	free(um);
+	um = NULL;
 }
 
 /*
@@ -289,8 +317,6 @@ static void read_unit_masks(char const * file)
 		} else {
 			if (!um)
 				parse_error("no unit mask name line");
-			if (um->num >= MAX_UNIT_MASK)
-				parse_error("oprofile: maximum unit mask entries exceeded");
 
 			parse_um_entry(&um->um[um->num], line);
 			++(um->num);
@@ -475,6 +501,7 @@ static void read_events(char const * file)
 	int seen_event, seen_counters, seen_um, seen_minimum, seen_name, seen_ext;
 	FILE * fp = fopen(file, "r");
 	int tags;
+	int fail = 0;
 
 	if (!fp) {
 		fprintf(stderr, "oprofile: could not open event description file %s\n", file);
@@ -487,6 +514,8 @@ static void read_events(char const * file)
 	line = op_get_line(fp);
 
 	while (line) {
+		int bad_val = 0;
+		u64 tmp_val = 0ULL;
 		if (empty_line(line) || comment_line(line))
 			goto next;
 
@@ -512,11 +541,21 @@ static void read_events(char const * file)
 				if (strchr(value, '.') != NULL)
 					parse_error("invalid event name");
 				event->name = value;
+				if (bad_val) {
+					fprintf(stderr, "Event %s event code (0x%llx) is too big to fit in an int\n",
+					        event->name, tmp_val);
+					fail = 1;
+					bad_val = 0;
+				}
 			} else if (strcmp(name, "event") == 0) {
 				if (seen_event)
 					parse_error("duplicate event: tag");
 				seen_event = 1;
-				event->val = parse_hex(value);
+				tmp_val = parse_long_hex(value);
+				if (tmp_val > 0xffffffff)
+					bad_val = 1;
+				else
+					event->val = (u32)tmp_val;
 				free(value);
 			} else if (strcmp(name, "counters") == 0) {
 				if (seen_counters)
@@ -561,6 +600,7 @@ static void read_events(char const * file)
 				c = skip_ws(c);
 				if (*c != '\0' && *c != '#')
 					parse_error("non whitespace after include:");
+				break;
 			} else {
 				parse_error("unknown tag");
 			}
@@ -575,6 +615,8 @@ next:
 	}
 
 	fclose(fp);
+	if (fail)
+		exit(EXIT_FAILURE);
 }
 
 
@@ -604,10 +646,18 @@ static int check_unit_mask(struct op_unit_mask const * um,
 				"(%s)\n", um->name, cpu_name);
 			err = EXIT_FAILURE;
 		}
-	} else {
-		for (i = 0; i < um->num; ++i) {
-			if (um->default_mask == um->um[i].value)
-				break;
+	} else if (um->unit_type_mask == utm_exclusive) {
+		if (um->default_mask_name) {
+			for (i = 0; i < um->num; ++i) {
+				if (0 == strcmp(um->default_mask_name,
+						um->um[i].name))
+					break;
+			}
+		} else {
+			for (i = 0; i < um->num; ++i) {
+				if (um->default_mask == um->um[i].value)
+					break;
+			}
 		}
 
 		if (i == um->num) {
@@ -651,8 +701,6 @@ static void load_events(op_cpu cpu_type)
 {
 	const char * cpu_name = op_get_cpu_name(cpu_type);
 	struct list_head * pos;
-	struct op_event *event;
-	struct op_unit_mask *unit_mask;
 	int err = 0;
 
 	if (!list_empty(&events_list))
@@ -670,56 +718,6 @@ static void load_events(op_cpu cpu_type)
 	if (err)
 		exit(err);
 
-	if (!op_cpu_has_timer_fs())
-		return;
-
-	/* sanity check: Don't use event `TIMER' since it is predefined.  */
-	list_for_each(pos, &events_list) {
-		struct op_event * event = list_entry(pos, struct op_event,
-						     event_next);
-
-		if (strcmp(event->name, TIMER_EVENT_NAME) == 0) {
-			fprintf(stderr, "Error: " TIMER_EVENT_NAME
-				" event cannot be redefined.\n");
-			exit(EXIT_FAILURE);
-		}
-		if (event->val == TIMER_EVENT_VALUE) {
-			fprintf(stderr, "Error: Event %s uses " TIMER_EVENT_NAME
-				" which is reserverd for timer based sampling.\n",
-				event->name);
-			exit(EXIT_FAILURE);
-		}
-	}
-
-	list_for_each(pos, &um_list) {
-		struct op_unit_mask * um = list_entry(pos, struct op_unit_mask,
-						      um_next);
-		if (strcmp(um->name, TIMER_EVENT_UNIT_MASK_NAME) == 0) {
-			fprintf(stderr, "Error: " TIMER_EVENT_UNIT_MASK_NAME
-				" unit mask cannot be redefined.\n");
-			exit(EXIT_FAILURE);
-		}
-	}
-
-	unit_mask = new_unit_mask();
-	unit_mask->name = xstrdup(TIMER_EVENT_UNIT_MASK_NAME);
-	unit_mask->num = 1;
-	unit_mask->unit_type_mask = utm_mandatory;
-	unit_mask->um[0].extra = 0;
-	unit_mask->um[0].value = 0;
-	unit_mask->um[0].desc = xstrdup("No unit mask");
-	unit_mask->used = 1;
-
-	event = new_event();
-	event->name = xstrdup(TIMER_EVENT_NAME);
-	event->desc = xstrdup(TIMER_EVENT_DESC);
-	event->val = TIMER_EVENT_VALUE;
-	event->unit = unit_mask;
-	event->min_count = 0;
-	event->filter = 0;
-	event->counter_mask = 1 << (op_get_nr_counters(cpu_type) - 1);
-	event->ext = NULL;
-	event->filter = -1;
 }
 
 struct list_head * op_events(op_cpu cpu_type)
@@ -915,7 +913,6 @@ char const * find_mapping_for_event(u32 nr, op_cpu cpu_type)
 	FILE * fp = open_event_mapping_file(cpu_name);
 	char const * map = NULL;
 	switch (cpu_type) {
-		case CPU_PPC64_PA6T:
 		case CPU_PPC64_970:
 		case CPU_PPC64_970MP:
 		case CPU_PPC64_POWER4:
@@ -924,7 +921,7 @@ char const * find_mapping_for_event(u32 nr, op_cpu cpu_type)
 		case CPU_PPC64_POWER5pp:
 		case CPU_PPC64_POWER6:
 		case CPU_PPC64_POWER7:
-		case CPU_PPC64_IBM_COMPAT_V1:
+		// For ppc64 types of CPU_PPC64_ARCH_V1 and higher, we don't need an event_mappings file
 			if (!fp) {
 				fprintf(stderr, "oprofile: could not open event mapping file %s\n", filename);
 				exit(EXIT_FAILURE);
@@ -1011,12 +1008,112 @@ struct op_event * op_find_event_any(op_cpu cpu_type, u32 nr)
 	return find_event_any(nr);
 }
 
-int op_check_events(int ctr, u32 nr, u32 um, op_cpu cpu_type)
+static int _is_um_valid_bitmask(struct op_event * event, u32 passed_um)
+{
+	int duped_um[MAX_UNIT_MASK];
+	int retval = 0;
+	u32 masked_val = 0;
+	u32 i, k;
+	int dup_value_used = 0;
+
+	struct op_event evt;
+	struct op_unit_mask * tmp_um = xmalloc(sizeof(struct op_unit_mask));
+	struct op_unit_mask * tmp_um_no_dups = xmalloc(sizeof(struct op_unit_mask));
+	memset(tmp_um, '\0', sizeof(struct op_unit_mask));;
+	memset(tmp_um_no_dups, '\0', sizeof(struct op_unit_mask));
+	memset(duped_um, '\0', sizeof(int) * MAX_UNIT_MASK);
+
+	// First, we make a copy of the event, with just its unit mask values.
+	evt.unit = tmp_um;
+	evt.unit->num = event->unit->num;
+	for (i = 0; i < event->unit->num; i++)
+		evt.unit->um[i].value = event->unit->um[i].value;
+
+	// Next, we sort the unit mask values in ascending order.
+	for (i = 1; i < evt.unit->num; i++) {
+		int j = i - 1;
+		u32 tmp = evt.unit->um[i].value;
+		while (j >= 0 && tmp < evt.unit->um[j].value) {
+			evt.unit->um[j + 1].value = evt.unit->um[j].value;
+			j -= 1;
+		}
+		evt.unit->um[j + 1].value = tmp;
+	}
+
+	/* Now we remove duplicates. Duplicate unit mask values were not
+	 * allowed until the "named unit mask" support was added in
+	 * release 0.9.7.  The down side to this is that if the user passed
+	 * a unit mask value that includes one of the duplicated values,
+	 * we have no way of differentiating between the duplicates, so
+	 * the meaning of the bitmask would be ambiguous if we were to
+	 * allow it.  Thus, we must prevent the user from specifying such
+	 * bitmasks.
+	 */
+	for (i = 0, k = 0; k < evt.unit->num; i++) {
+		tmp_um_no_dups->um[i].value = evt.unit->um[k].value;
+		tmp_um_no_dups->num++;
+		k++;
+		while ((evt.unit->um[i].value == evt.unit->um[k].value) && i < evt.unit->num) {
+			k++;
+			duped_um[i] = 1;
+		}
+	}
+	evt.unit = tmp_um_no_dups;
+
+	// Now check if passed um==0 and if the defined event has a UM with value '0'.
+	if (!passed_um) {
+		for (i = 0; i < evt.unit->num; i++) {
+			if (!evt.unit->um[i].value)
+				return 1;
+		}
+	}
+
+	/* Finally, we'll see if the passed unit mask value can be matched with a
+	 * mask of available unit mask values. We check for this by determining
+	 * whether the exact bits set in the current um are also set in the
+	 * passed um; if so, we OR those bits into a cumulative masked_val variable.
+	 * Simultaneously, we check if the passed um contains a non-unique unit
+	 * mask value, in which case, it's invalid..
+	 */
+	for (i = 0; i < evt.unit->num; i++) {
+		if ((evt.unit->um[i].value & passed_um) == evt.unit->um[i].value) {
+			masked_val |= evt.unit->um[i].value;
+			if (duped_um[i]) {
+				dup_value_used = 1;
+				break;
+			}
+		}
+	}
+
+	if (dup_value_used) {
+		fprintf(stderr, "Ambiguous bitmask: Unit mask values"
+		        " cannot include non-unique numerical values (i.e., 0x%x).\n",
+		        evt.unit->um[i].value);
+		fprintf(stderr, "Use ophelp to see the unit mask values for event %s.\n",
+		        event->name);
+	} else if (masked_val == passed_um && passed_um != 0) {
+		retval = 1;
+	}
+	free(tmp_um);
+	free(tmp_um_no_dups);
+	return retval;
+}
+
+static int _is_ppc64_cpu_type(op_cpu cpu_type) {
+	char const * cpu_name = op_get_cpu_name(cpu_type);
+	if (strncmp(cpu_name, "ppc64/power", strlen("ppc64/power")) == 0)
+		return 1;
+	else
+		return 0;
+}
+
+int op_check_events(char * evt_name, int ctr, u32 nr, u32 um, op_cpu cpu_type)
 {
 	int ret = OP_INVALID_EVENT;
 	size_t i;
-	u32 masked_val, ctr_mask = 1 << ctr;
+	u32 ctr_mask = 1 << ctr;
 	struct list_head * pos;
+	int ibm_power_proc = _is_ppc64_cpu_type(cpu_type);
 
 	load_events(cpu_type);
 
@@ -1025,25 +1122,46 @@ int op_check_events(int ctr, u32 nr, u32 um, op_cpu cpu_type)
 		if (event->val != nr)
 			continue;
 
+		// Why do we have to do this, since event codes are supposed to be unique?
+		// See the big comment below.
+		if (ibm_power_proc && strcmp(evt_name, event->name))
+			continue;
+
 		ret = OP_OK_EVENT;
 
 		if ((event->counter_mask & ctr_mask) == 0)
 			ret |= OP_INVALID_COUNTER;
 
 		if (event->unit->unit_type_mask == utm_bitmask) {
-			masked_val = 0;
-			for (i = 0; i < event->unit->num; i++) {
-				if ((event->unit->um[i].value & um) == event->unit->um[i].value)
-					masked_val |= event->unit->um[i].value;
-			}
-			if (!(masked_val == um && um != 0))
+			if (!_is_um_valid_bitmask(event, um))
 				ret |= OP_INVALID_UM;
 		} else {
 			for (i = 0; i < event->unit->num; ++i) {
 				if (event->unit->um[i].value == um)
 					break;
 			}
-			if (i == event->unit->num)
+			/* A small number of events on the IBM Power8 processor have real event
+			 * codes that are larger than sizeof(int). Rather than change the width of
+			 * the event code everywhere to be a long int (which would include having to
+			 * change the sample file format), we have defined some internal-use-only
+			 * unit masks for those events. In oprofile's power8 events file, we have
+			 * truncated those event codes to integer size, and the truncated bits are
+			 * used as a unit mask value which is ORed into the event code by
+			 * libpe_utils/op_pe_utils.cpp:_get_event_code(). This technique allowed
+			 * us to handle this situation with minimal code perturbation.  The one
+			 * downside is that the truncated event codes are not unique.  So in this
+			 * function, where we're searching for events by 'nr' (i.e., the event code),
+			 * we have to also make sure the name matches.
+			 *
+			 * If the user gives us an event specification such as:
+			 *      PM_L1MISS_LAT_EXC_256:0x0:1:1
+			 * the above code will actually find a non-zero unit mask for this event and
+			 * we'd normally fail at this point since the user passed '0x0' for a unit mask.
+			 * But we don't expose these internal-use-only UMs to the user, so there's
+			 * no way for them to know about it or to try to use it in their event spec;
+			 * thus, we handle it below.
+			 */
+			if ((i == event->unit->num) && !((um == 0) && ibm_power_proc))
 				ret |= OP_INVALID_UM;
 		}
 
@@ -1081,6 +1199,8 @@ void op_default_event(op_cpu cpu_type, struct op_default_event_descr * descr)
  		case CPU_CORE_I7:
 		case CPU_NEHALEM:
 		case CPU_HASWELL:
+		case CPU_BROADWELL:
+		case CPU_SILVERMONT:
 		case CPU_WESTMERE:
 		case CPU_SANDYBRIDGE:
 		case CPU_IVYBRIDGE:
@@ -1088,12 +1208,8 @@ void op_default_event(op_cpu cpu_type, struct op_default_event_descr * descr)
 		case CPU_FAMILY12H:
 		case CPU_FAMILY14H:
 		case CPU_FAMILY15H:
+		case CPU_AMD64_GENERIC:
 			descr->name = "CPU_CLK_UNHALTED";
-			break;
-
-		case CPU_RTC:
-			descr->name = "RTC_INTERRUPTS";
-			descr->count = 1024;
 			break;
 
 		case CPU_P4:
@@ -1102,19 +1218,9 @@ void op_default_event(op_cpu cpu_type, struct op_default_event_descr * descr)
 			descr->um = 0x1;
 			break;
 
-		case CPU_IA64:
-		case CPU_IA64_1:
-		case CPU_IA64_2:
-			descr->count = 1000000;
-			descr->name = "CPU_CYCLES";
-			break;
-
-		case CPU_AXP_EV4:
-		case CPU_AXP_EV5:
-		case CPU_AXP_PCA56:
-		case CPU_AXP_EV6:
 		case CPU_AXP_EV67:
 			descr->name = "CYCLES";
+			descr->um = 0x1;
 			break;
 
 		// we could possibly use the CCNT
@@ -1127,13 +1233,15 @@ void op_default_event(op_cpu cpu_type, struct op_default_event_descr * descr)
 		case CPU_ARM_V7_CA7:
 		case CPU_ARM_V7_CA9:
 		case CPU_ARM_V7_CA15:
-		case CPU_AVR32:
 		case CPU_ARM_SCORPION:
 		case CPU_ARM_SCORPIONMP:
+		case CPU_ARM_KRAIT:
+		case CPU_ARM_V8_APM_XGENE:
+		case CPU_ARM_V8_CA57:
+		case CPU_ARM_V8_CA53:
 			descr->name = "CPU_CYCLES";
 			break;
 
-		case CPU_PPC64_PA6T:
 		case CPU_PPC64_970:
 		case CPU_PPC64_970MP:
 		case CPU_PPC_7450:
@@ -1142,9 +1250,9 @@ void op_default_event(op_cpu cpu_type, struct op_default_event_descr * descr)
 		case CPU_PPC64_POWER6:
 		case CPU_PPC64_POWER5p:
 		case CPU_PPC64_POWER5pp:
-		case CPU_PPC64_CELL:
 		case CPU_PPC64_POWER7:
-		case CPU_PPC64_IBM_COMPAT_V1:
+		case CPU_PPC64_ARCH_V1:
+		case CPU_PPC64_POWER8:
 			descr->name = "CYCLES";
 			break;
 
@@ -1185,6 +1293,8 @@ void op_default_event(op_cpu cpu_type, struct op_default_event_descr * descr)
 
 		case CPU_PPC_E500:
 		case CPU_PPC_E500_2:
+		case CPU_PPC_E500MC:
+		case CPU_PPC_E6500:
 		case CPU_PPC_E300:
 			descr->name = "CPU_CLK";
 			break;
@@ -1192,14 +1302,9 @@ void op_default_event(op_cpu cpu_type, struct op_default_event_descr * descr)
 		case CPU_S390_Z10:
 		case CPU_S390_Z196:
 		case CPU_S390_ZEC12:
- 			if (op_get_nr_counters(cpu_type) > 1) {
- 				descr->name = "HWSAMPLING";
- 				descr->count = 4127518;
- 			} else {
- 				descr->name = TIMER_EVENT_NAME;
- 				descr->count = 10000;
- 			}
-  			break;
+			descr->name = "CPU_CYCLES";
+			descr->count = 4127518;
+			break;
 
 		case CPU_TILE_TILE64:
 		case CPU_TILE_TILEPRO:
@@ -1224,8 +1329,8 @@ static void extra_check(struct op_event *e, char *name, unsigned w)
 	if (!e->unit->um[w].extra) {
 		fprintf(stderr,
 			"Named unit mask (%s) not allowed for event without 'extra:' values.\n"
-			"Please specify the numerical value for the unit mask. See 'opcontrol'\n"
-			"or 'operf' man page for more info.\n", name);
+			"Please specify the numerical value for the unit mask. See the 'operf'\n"
+			"man page for more info.\n", name);
 		exit(EXIT_FAILURE);
 	}
 
@@ -1244,14 +1349,23 @@ static void extra_check(struct op_event *e, char *name, unsigned w)
 	}
 }
 
-static void do_resolve_unit_mask(struct op_event *e, struct parsed_event *pe, u32 *extra)
+static void do_resolve_unit_mask(struct op_event *e,
+	struct parsed_event *pe, u32 *extra)
 {
 	unsigned i;
+
+	/* If not specified um and the default um is name type
+	 * we populate pe unitmask name with default name */
+	if ((e->unit->default_mask_name != NULL) &&
+			(pe->unit_mask_name == NULL) && (!pe->unit_mask_valid)) {
+		pe->unit_mask_name = xstrdup(e->unit->default_mask_name);
+	}
 
 	for (;;) {
 		if (pe->unit_mask_name == NULL) {
 			/* For numerical unit mask */
 			int found = 0;
+			int old_um_valid = pe->unit_mask_valid;
 
 			/* Use default unitmask if not specified */
 			if (!pe->unit_mask_valid) {
@@ -1267,9 +1381,16 @@ static void do_resolve_unit_mask(struct op_event *e, struct parsed_event *pe, u3
 					found++;
 			}
 			if (found > 1) {
-				fprintf(stderr, "Unit mask (0x%x) is non unique.\n"
-				        "Please specify the unit mask using the first "
-					"word of the description\n",
+				if (!old_um_valid)
+					fprintf(stderr,
+						"Default unit mask not supported for this event.\n"
+						"Please speicfy a unit mask by name, using the first "
+						"word of the unit mask description\n");
+				else
+					fprintf(stderr,
+						"Unit mask (0x%x) is non unique.\n"
+						"Please specify the unit mask using the first "
+						"word of the description\n",
 					pe->unit_mask);
 				exit(EXIT_FAILURE);
 			}
@@ -1283,9 +1404,15 @@ static void do_resolve_unit_mask(struct op_event *e, struct parsed_event *pe, u3
 		} else {
 			/* For named unit mask */
 			for (i = 0; i < e->unit->num; i++) {
-				int len = strcspn(e->unit->um[i].desc, " \t");
-				if (!strncmp(pe->unit_mask_name, e->unit->um[i].desc,
-					    len) && pe->unit_mask_name[len] == '\0')
+				int len = 0;
+
+				if (e->unit->um[i].name)
+					len = strlen(e->unit->um[i].name);
+
+				if (len
+				&&  (!strncmp(pe->unit_mask_name,
+					      e->unit->um[i].name, len))
+				&&  (pe->unit_mask_name[len] == '\0'))
 					break;
 			}
 			if (i == e->unit->num) {
@@ -1299,8 +1426,12 @@ static void do_resolve_unit_mask(struct op_event *e, struct parsed_event *pe, u3
 			extra_check(e, pe->unit_mask_name, i);
 			pe->unit_mask_valid = 1;
 			pe->unit_mask = e->unit->um[i].value;
-			if (extra)
-				*extra = e->unit->um[i].extra;
+			if (extra) {
+				if (e->unit->um[i].extra == EXTRA_NONE)
+					*extra = e->unit->um[i].value;
+				else
+					*extra = e->unit->um[i].extra;
+			}
 			return;
 		}
 	}

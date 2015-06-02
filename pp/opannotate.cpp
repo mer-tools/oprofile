@@ -466,6 +466,10 @@ void output_objdump_asm(symbol_collection const & symbols,
 	string image =
 		classes.extra_found_images.find_image_path(app_name, error,
 							   true);
+	if (image == "/proc/kallsyms") {
+		cerr << "Cannot annotate pseudo file /proc/kallsyms -- ignoring." << endl;
+		return;
+	}
 
 	// this is only an optimisation, we can either filter output by
 	// directly calling objdump and rely on the symbol filtering or
@@ -839,8 +843,8 @@ int opannotate(options::spec const & spec)
 	}
 
 	if (!debug_info && !options::assembly) {
-		cerr << "opannotate (warning): no debug information available for binary "
-		     << it->image << ", and --assembly not requested\n";
+		cerr << "opannotate (warning): no debug information available for any binary "
+		     << "selected, and --assembly not requested.\n";
 	}
 
 	annotate_source(images);

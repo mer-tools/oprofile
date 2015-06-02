@@ -385,7 +385,13 @@ bool valid_candidate(string const & base_dir, string const & filename,
 	if (!is_prefix(sub, "/{root}/") && !is_prefix(sub, "/{kern}/"))
 		return false;
 
-	/* When overflows occur in the oprofile kernel driver's sample
+	/** NOTE: This comment and associated code is actually obsolete now,
+	 * since opcontrol and the oprofile kernel driver are no longer
+	 * in use with oprofile (as of release 1.0).  It seems extremely
+	 * unlikely we could encounter the same sort of issue using operf,
+	 * but it doesn't hurt to keep the code to be on the safe side.
+	 *
+	 * When overflows occur in the oprofile kernel driver's sample
 	 * buffers (caused by too high of a sampling rate), it's possible
 	 * for samples to be mis-attributed.  A common scenario is that,
 	 * while profiling process 'abc' running binary 'xzy', the task
@@ -453,7 +459,7 @@ bool valid_candidate(string const & base_dir, string const & filename,
  * Print a warning message if we detect any sample buffer overflows
  * occurred in the kernel driver. 
  */
-void warn_if_kern_buffs_overflow(string const & session_samples_dir)
+static void warn_if_kern_buffs_overflow(string const & session_samples_dir)
 {
 	DIR * dir;
 	struct dirent * dirent;
@@ -492,6 +498,61 @@ void warn_if_kern_buffs_overflow(string const & session_samples_dir)
 		     << " (or at least minimize)" << endl
 		     <<	"these overflows." << endl;
 	}
+}
+
+static void warn_if_kern_throttling(string const & session_samples_dir)
+{
+	DIR * dir;
+	string stats_path;
+
+	/* check for throttled */
+	stats_path = session_samples_dir + "stats/throttled";
+	dir = opendir(stats_path.c_str());
+	if (dir != NULL) {
+		cerr << "\nWARNING! Some of the events were throttled. "
+		     << "Throttling occurs when\n";
+		cerr << "the initial sample rate is too high, causing an "
+		     << "excessive number of\n";
+		cerr << "interrupts.  Decrease the sampling frequency. "
+		     << "Check the directory\n";
+		cerr << stats_path << "\n"
+		     << "for the throttled event names.\n\n";
+		closedir(dir);
+	}
+}
+
+static void warn_if_lost_samples(string const & session_samples_dir)
+{
+	string stats_path;
+	string operf_log(op_session_dir);
+	unsigned long total_samples;
+	unsigned long total_lost_samples = 0;
+
+	stats_path = session_samples_dir + "stats/";
+	total_samples = op_read_long_from_file((stats_path + "total_samples").
+	                             c_str(), 0);
+	if (total_samples == ((unsigned long)-1))
+		return;
+
+	for (int i = OPERF_INDEX_OF_FIRST_LOST_STAT; i < OPERF_MAX_STATS; i++) {
+		unsigned long lost_samples_count = op_read_long_from_file((stats_path + stats_filenames[i]).c_str(), 0);
+		if (!(lost_samples_count == ((unsigned long)-1)))
+			total_lost_samples += lost_samples_count;
+	}
+
+	if (total_lost_samples > (unsigned int)(OPERF_WARN_LOST_SAMPLES_THRESHOLD
+				       * total_samples)) {
+		operf_log.append("/samples/operf.log");
+		cerr << "\nWARNING: Lost samples detected! See " <<  operf_log
+		     << " for details." << endl;
+	}
+}
+
+static void warn_if_sampling_problems(string const & session_samples_dir)
+{
+	warn_if_kern_buffs_overflow(session_samples_dir);
+	warn_if_kern_throttling(session_samples_dir);
+	warn_if_lost_samples(session_samples_dir);
 }
 
 
@@ -540,7 +601,7 @@ list<string> profile_spec::generate_file_list(bool exclude_dependent,
 
 		if (!files.empty()) {
 			found_file = true;
-			warn_if_kern_buffs_overflow(base_dir + "/");
+			warn_if_sampling_problems(base_dir + "/");
 		}
 
 		list<string>::const_iterator it = files.begin();
@@ -561,9 +622,8 @@ list<string> profile_spec::generate_file_list(bool exclude_dependent,
 
 	if (!found_file) {
 		ostringstream os;
-		os  << "No sample file found: If using opcontrol for profiling,\n"
-		    << "try running 'opcontrol --dump'; otherwise, specify a session containing\n"
-		    << "sample files.\n";
+		os  << "No sample found: Please specify a session containing \n"
+		    << "sample data.\n";
 		throw op_fatal_error(os.str());
 	}
 

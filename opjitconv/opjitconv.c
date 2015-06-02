@@ -15,15 +15,16 @@
  */
 
 #include "opjitconv.h"
-#include "opd_printf.h"
 #include "op_file.h"
 #include "op_libiberty.h"
 
+#include <getopt.h>
 #include <dirent.h>
 #include <fnmatch.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <assert.h>
 #include <pwd.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -33,6 +34,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <wait.h>
+#include <sys/file.h>
 
 /*
  * list head.  The linked list is used during parsing (parse_all) to
@@ -74,6 +76,19 @@ int debug;
 int non_root;
 /* indicates we should delete jitdump files owned by the user */
 int delete_jitdumps;
+/* Session directory where sample data is stored */
+char * session_dir;
+
+static struct option long_options [] = {
+                                        { "session-dir", required_argument, NULL, 's'},
+                                        { "debug", no_argument, NULL, 'd'},
+                                        { "delete-jitdumps", no_argument, NULL, 'j'},
+                                        { "non-root", no_argument, NULL, 'n'},
+                                        { "help", no_argument, NULL, 'h'},
+                                        { NULL, 9, NULL, 0}
+};
+const char * short_options = "s:djnh";
+
 LIST_HEAD(jitdump_deletion_candidates);
 
 /*
@@ -143,6 +158,8 @@ static int mmap_jitdump(char const * dumpfile,
 		rc = OP_JIT_CONV_FAIL;
 	}
 out:
+	if (dumpfd != -1)
+		close(dumpfd);
 	return rc;
 }
 
@@ -195,10 +212,31 @@ out:
  */
 int copy_dumpfile(char const * dumpfile, char * tmp_dumpfile)
 {
+#define OP_JITCONV_USECS_TO_WAIT 1000
+	int file_locked = 0;
+	unsigned int usecs_waited = 0;
 	int rc = OP_JIT_CONV_OK;
-
+	int fd = open(dumpfile, O_RDONLY);
+	if (fd < 0) {
+		perror("opjitconv failed to open JIT dumpfile");
+		return OP_JIT_CONV_FAIL;
+	}
+again:
+	// Need OS-level file locking here since opagent may still be writing to the file.
+	rc = flock(fd, LOCK_EX | LOCK_NB);
+	if (rc) {
+		if (usecs_waited < OP_JITCONV_USECS_TO_WAIT) {
+			usleep(100);
+			usecs_waited += 100;
+			goto again;
+		} else {
+			printf("opjitconv: Unable to obtain lock on %s.\n", dumpfile);
+			rc = OP_JIT_CONV_FAIL;
+			goto out;
+		}
+	}
+	file_locked = 1;
 	sprintf(sys_cmd_buffer, "/bin/cp -p %s %s", dumpfile, tmp_dumpfile);
-
 	if (system(sys_cmd_buffer) != 0) {
 		printf("opjitconv: Calling system() to copy files failed.\n");
 		rc = OP_JIT_CONV_FAIL;
@@ -212,6 +250,11 @@ int copy_dumpfile(char const * dumpfile, char * tmp_dumpfile)
 	}
 	
 out:
+#undef OP_JITCONV_USECS_TO_WAIT
+	close(fd);
+	if (file_locked)
+		flock(fd, LOCK_UN);
+
 	return rc;
 }
 
@@ -318,10 +361,8 @@ chk_proc_id:
 		goto out;
 	}
 	if (!(anon_dir = find_anon_dir_match(anon_sample_dirs, proc_id))) {
-		/* With the capability of profiling with operf (as well as with
-		 * the legacy oprofile daemon), users will not be using opcontrol
-		 * to remove all jitdump files; instead, opjitconv will remove old
-		 * jitdump files (see _cleanup_jitdumps() for details).  But this cleanup
+		/* When profiling with operf, opjitconv will remove old jitdump
+		 * files (see _cleanup_jitdumps() for details).  But this cleanup
 		 * strategy makes it quite likely that opjitconv will sometimes find
 		 * jitdump files that are not owned by the current user or are in use
 		 * by other operf users, thus, the current profile data would not have
@@ -366,6 +407,7 @@ chk_proc_id:
 		if (jofd < 0)
 			goto create_elf;
 		rc = fstat(jofd, &file_stat);
+		close(jofd);
 		if (rc < 0) {
 			perror("opjitconv:fstat on .jo file");
 			rc = OP_JIT_CONV_FAIL;
@@ -403,7 +445,10 @@ chk_proc_id:
 			goto free_res3;
 		}
 		/* Convert the dump file as the special user 'oprofile'. */
-		rc = op_jit_convert(dmp_info, tmp_elffile, start_time, end_time);
+		rc = op_jit_convert(&dmp_info, tmp_elffile, start_time, end_time);
+		if (rc < 0)
+			goto free_res3;
+
 		/* Set eUID back to the original user. */
 		if (!non_root && seteuid(getuid()) != 0) {
 			perror("opjitconv: seteuid to original user failed");
@@ -522,9 +567,11 @@ static void _add_jitdumps_to_deletion_list(void * all_jitdumps, char const * jit
 		if (fstat(fd, &mystat) < 0) {
 			// Non-fatal error, so just display debug message and continue
 			verbprintf(debug, "opjitconv: cannot fstat jitdump file");
+			close(fd);
 			continue;
 		}
-		if (geteuid() == mystat.st_uid) {
+		close(fd);
+		if (!non_root || geteuid() == mystat.st_uid) {
 			struct jitdump_deletion_candidate * jdc =
 					xmalloc(sizeof(struct jitdump_deletion_candidate));
 			jdc->name = xstrdup(dmpfile->name);
@@ -540,7 +587,7 @@ static int op_process_jit_dumpfiles(char const * session_dir,
 	int rc = OP_JIT_CONV_OK;
 	char jitdumpfile[PATH_MAX + 1];
 	char oprofile_tmp_template[PATH_MAX + 1];
-	char const * jitdump_dir = "/var/lib/oprofile/jitdump/";
+	char const * jitdump_dir = "/tmp/.oprofile/jitdump/";
 
 	LIST_HEAD(jd_fnames);
 	char const * anon_dir_filter = "*/{dep}/{anon:anon}/[0-9]*.*";
@@ -684,7 +731,7 @@ out:
 static void _cleanup_jitdumps(void)
 {
 	struct list_head * pos1, *pos2;
-	char const * jitdump_dir = "/var/lib/oprofile/jitdump/";
+	char const * jitdump_dir = "/tmp/.oprofile/jitdump/";
 	size_t dir_len = strlen(jitdump_dir);
 	char dmpfile_pathname[dir_len + 20];
 	char proc_fd_dir[PATH_MAX];
@@ -729,7 +776,9 @@ static void _cleanup_jitdumps(void)
 				if (dirent->d_type == DT_LNK) {
 					char buf[1024];
 					char fname[1024];
+					memset(buf, '\0', 1024);
 					memset(fname, '\0', 1024);
+					memset(buf, '\0', 1024);
 					strcpy(fname, proc_fd_dir);
 					strncat(fname, dirent->d_name, 1023 - proc_fd_dir_len);
 					if (readlink(fname, buf, 1023) > 0) {
@@ -742,9 +791,13 @@ static void _cleanup_jitdumps(void)
 					}
 				}
 			}
+			closedir(dir);
 		}
-		if (!do_not_delete)
-			remove(dmpfile_pathname);
+		if (!do_not_delete) {
+			if (remove(dmpfile_pathname))
+				verbprintf(debug, "Unable to delete %s: %s\n", dmpfile_pathname,
+				           strerror(errno));
+		}
 	}
 	list_for_each_safe(pos1, pos2, &jitdump_deletion_candidates) {
 		struct jitdump_deletion_candidate * pname = list_entry(pos1,
@@ -757,55 +810,102 @@ static void _cleanup_jitdumps(void)
 
 }
 
-int main(int argc, char ** argv)
+static void __print_usage(void)
+{
+	fprintf(stderr, "usage: opjitconv [--debug | --non-root | --delete-jitdumps ] --session-dir=<dir> <starttime> <endtime>\n");
+}
+
+static int _process_args(int argc, char * const argv[])
+{
+	int keep_trying = 1;
+	int idx_of_non_options = 0;
+	char * prev_env = getenv("POSIXLY_CORRECT");
+	setenv("POSIXLY_CORRECT", "1", 0);
+	while (keep_trying) {
+		int option_idx = 0;
+		int c = getopt_long(argc, argv, short_options, long_options, &option_idx);
+		switch (c) {
+		case -1:
+			if (optind != argc) {
+				idx_of_non_options = optind;
+			}
+			keep_trying = 0;
+			break;
+		case '?':
+			printf("non-option detected at optind %d\n", optind);
+			keep_trying = 0;
+			idx_of_non_options = -1;
+			break;
+		case 's':
+			session_dir = optarg;
+			break;
+		case 'd':
+			debug = 1;
+			break;
+		case 'n':
+			non_root = 1;
+			break;
+		case 'j':
+			delete_jitdumps = 1;
+			break;
+		case 'h':
+			break;
+		default:
+			break;
+		}
+	}
+
+	if (prev_env == NULL)
+		unsetenv("POSIXLY_CORRECT");
+
+	return idx_of_non_options;
+}
+
+int main(int argc, char * const argv[])
 {
 	unsigned long long start_time, end_time;
-	char const * session_dir;
-	int rc = 0;
+	struct stat filestat;
+	int non_options_idx, rc = 0;
+	size_t sessdir_len = 0;
 
 	debug = 0;
-	if (argc > 1 && strcmp(argv[1], "-d") == 0) {
-		debug = 1;
-		argc--;
-		argv++;
-	}
 	non_root = 0;
-	if (argc > 1 && strcmp(argv[1], "--non-root") == 0) {
-		non_root = 1;
-		argc--;
-		argv++;
-	}
-
 	delete_jitdumps = 0;
-	if (argc > 1 && strcmp(argv[1], "--delete-jitdumps") == 0) {
-		delete_jitdumps = 1;
-		argc--;
-		argv++;
-	}
-
-	if (argc != 4) {
-		printf("Usage: opjitconv [-d] <session_dir> <starttime>"
-		       " <endtime>\n");
+	session_dir = NULL;
+	non_options_idx = _process_args(argc, argv);
+	// We need the session_dir and two non-option values passed -- starttime and endtime.
+	if (!session_dir || (non_options_idx != argc - 2)) {
+		__print_usage();
 		fflush(stdout);
 		rc = EXIT_FAILURE;
 		goto out;
 	}
 
-	session_dir = argv[1];
 	/*
-	 * Check for a maximum of 4096 bytes (Linux path name length limit) decremented
-	 * by 16 bytes (will be used later for appending samples sub directory).
+	 * Check for a maximum of 4096 bytes (Linux path name length limit) minus 16 bytes
+	 * (to be used later for appending samples sub directory) minus 1 (for terminator).
 	 * Integer overflows according to the session dir parameter (user controlled)
 	 * are not possible anymore.
 	 */
-	if (strlen(session_dir) > PATH_MAX - 16) {
-		printf("opjitconv: Path name length limit exceeded for session directory: %s\n", session_dir);
+	if ((sessdir_len = strlen(session_dir)) >= (PATH_MAX - 17)) {
+		printf("opjitconv: Path name length limit exceeded for session directory\n");
 		rc = EXIT_FAILURE;
 		goto out;
 	}
 
-	start_time = atol(argv[2]);
-	end_time = atol(argv[3]);
+	if (stat(session_dir, &filestat)) {
+		perror("stat operation on passed session-dir failed");
+		rc = EXIT_FAILURE;
+		goto out;
+	}
+	if (!S_ISDIR(filestat.st_mode)) {
+		printf("Passed session-dir %s is not a directory\n", session_dir);
+		rc = EXIT_FAILURE;
+		goto out;
+	}
+
+	start_time = atol(argv[non_options_idx++]);
+	end_time = atol(argv[non_options_idx]);
 
 	if (start_time > end_time) {
 		rc = EXIT_FAILURE;

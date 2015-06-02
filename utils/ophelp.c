@@ -33,6 +33,7 @@ static op_cpu cpu_type = CPU_NO_GOOD;
 static char * cpu_string;
 static int callgraph_depth;
 static int want_xml;
+static int ignore_count;
 
 static poptContext optcon;
 
@@ -50,17 +51,6 @@ static size_t hweight(size_t mask)
 	return count;
 }
 
-static void do_arch_specific_event_help(struct op_event * event)
-{
-	switch (cpu_type) {
-	case CPU_PPC64_CELL:
-		printf("Group %u :", event->val / 100);
-		break;
-	default:
-		break;
-	}
-}
-
 #define LINE_LEN 99
 
 static void word_wrap(int indent, int *column, char *msg)
@@ -74,8 +64,9 @@ static void word_wrap(int indent, int *column, char *msg)
 		printf("%.*s", wlen, msg);
 		*column += wlen + 1;
 		msg += wlen;
-		msg += strspn(msg, " ");
-		if (*msg)
+		wlen = strspn(msg, " ");
+		msg += wlen;
+		if (wlen != 0)
 			putchar(' ');
 	}
 }
@@ -94,7 +85,6 @@ static void help_for_event(struct op_event * event)
 	size_t nr_counters;
 	char buf[32];
 
-	do_arch_specific_event_help(event);
 	nr_counters = op_get_nr_counters(cpu_type);
 
 	/* Sanity check */
@@ -136,34 +126,29 @@ static void help_for_event(struct op_event * event)
 
 	if (strcmp(event->unit->name, "zero")) {
 
-		printf("\tUnit masks (default 0x%x)\n",
-		       event->unit->default_mask);
+		if (event->unit->default_mask_name) {
+			printf("\tUnit masks (default %s)\n",
+			       event->unit->default_mask_name);
+		} else {
+			printf("\tUnit masks (default 0x%x)\n",
+			       event->unit->default_mask);
+		}
 		printf("\t----------\n");
 
 		for (j = 0; j < event->unit->num; j++) {
 			printf("\t0x%.2x: ",
 			       event->unit->um[j].value);
 			column = 14;
-			word_wrap(14, &column, event->unit->um[j].desc);
-			if (event->unit->um[j].extra) {
-				u32 extra = event->unit->um[j].extra;
 
-				word_wrap(14, &column, " (extra:");
-				if (extra & EXTRA_EDGE)
-					word_wrap(14, &column, " edge");
-				if (extra & EXTRA_INV)
-					word_wrap(14, &column, " inv");
-				if ((extra >> EXTRA_CMASK_SHIFT) & EXTRA_CMASK_MASK) {
-					snprintf(buf, sizeof buf, " cmask=%x",
-						 (extra >> EXTRA_CMASK_SHIFT) & EXTRA_CMASK_MASK);
-					word_wrap(14, &column, buf);
-				}
-				if (extra & EXTRA_ANY)
-					word_wrap(14, &column, " any");
-				if (extra & EXTRA_PEBS)
-					word_wrap(14, &column, " pebs");
-				word_wrap(14, &column, ")");
+			/* Named mask */
+			if (event->unit->um[j].name) {
+				word_wrap(14, &column, "(name=");
+				word_wrap(14, &column,
+					event->unit->um[j].name);
+				word_wrap(14, &column, ") ");
 			}
+
+			word_wrap(14, &column, event->unit->um[j].desc);
 			putchar('\n');
 		}
 	}
@@ -190,7 +175,12 @@ static void check_event(struct parsed_event * pev,
 
 	op_resolve_unit_mask(pev, NULL);
 
-	ret = op_check_events(0, event->val, pev->unit_mask, cpu_type);
+	// If a named UM is passed, op_resolve_unit_mask will resolve that into a
+	// valid unit mask, so we don't need to call op_check_events.
+	if (pev->unit_mask_name)
+		ret = 0;
+	else
+		ret = op_check_events(pev->name, 0, event->val, pev->unit_mask, cpu_type);
 
 	if (ret & OP_INVALID_UM) {
 		fprintf(stderr, "Invalid unit mask 0x%x for event %s\n",
@@ -201,7 +191,7 @@ static void check_event(struct parsed_event * pev,
 	min_count = event->min_count;
 	if (callgraph_depth)
 		min_count *= callgraph_min_count_scale;
-	if (pev->count < min_count) {
+	if (!ignore_count && pev->count < min_count) {
 		fprintf(stderr, "Count %d for event %s is below the "
 		        "minimum %d\n", pev->count, pev->name, min_count);
 		exit(EXIT_FAILURE);
@@ -217,7 +207,8 @@ static void resolve_events(void)
 	size_t nr_counters = op_get_nr_counters(cpu_type);
 	struct op_event const * selected_events[num_chosen_events];
 
-	count = parse_events(parsed_events, num_chosen_events, chosen_events);
+	count = parse_events(parsed_events, num_chosen_events, chosen_events,
+	                     ignore_count ? 0 : 1);
 
 	for (i = 0; i < count; ++i) {
 	        op_resolve_unit_mask(&parsed_events[i], NULL);
@@ -270,10 +261,7 @@ static void resolve_events(void)
 			else
 				printf("N/A ");
 		else
-			if (strcmp(selected_events[i]->name, TIMER_EVENT_NAME) == 0)
-				printf("timer ");
-			else
-				printf("%d ", (unsigned int) counter_map[i]);
+			printf("%d ", (unsigned int) counter_map[i]);
 	printf("\n");
 
 	free(counter_map);
@@ -284,7 +272,7 @@ static void show_unit_mask(void)
 {
 	size_t count;
 
-	count = parse_events(parsed_events, num_chosen_events, chosen_events);
+	count = parse_events(parsed_events, num_chosen_events, chosen_events, ignore_count ? 0 : 1);
 	if (count > 1) {
 		fprintf(stderr, "More than one event specified.\n");
 		exit(EXIT_FAILURE);
@@ -302,7 +290,7 @@ static void show_extra_mask(void)
 	size_t count;
 	unsigned extra = 0;
 
-	count = parse_events(parsed_events, num_chosen_events, chosen_events);
+	count = parse_events(parsed_events, num_chosen_events, chosen_events, ignore_count ? 0 : 1);
 	if (count > 1) {
 		fprintf(stderr, "More than one event specified.\n");
 		exit(EXIT_FAILURE);
@@ -337,6 +325,8 @@ static struct poptOption options[] = {
 	  "use the given CPU type", "cpu type", },
 	{ "check-events", 'e', POPT_ARG_NONE, &check_events, 0,
 	  "check the given event descriptions for validity", NULL, },
+	{ "ignore-count", 'i', POPT_ARG_NONE, &ignore_count, 0,
+	  "do not validate count value (used by ocount)", NULL},
 	{ "unit-mask", 'u', POPT_ARG_NONE, &unit_mask, 0,
 	  "default unit mask for the given event", NULL, },
 	{ "get-cpu-type", 'r', POPT_ARG_NONE, &get_cpu_type, 0,
@@ -445,8 +435,13 @@ int main(int argc, char const * argv[])
 	}
 
 	if (cpu_type == CPU_TIMER_INT) {
-		if (!check_events)
-			printf("Using timer interrupt.\n");
+		if (!check_events) {
+			printf("CPU type 'timer' was detected, but this is no longer a supported mode for oprofile.\n"
+			       "Ensure the obsolete opcontrol profiler (available in pre-1.0 oprofile releases)\n"
+			       "is not running on the system.  To check for this, look for the file\n"
+			       "/dev/oprofile/cpu_type; if this file exists, locate the pre-1.0 oprofile\n"
+			       "installation, and use its 'opcontrol' command with the --deinit option.\n");
+		}
 		exit(EXIT_SUCCESS);
 	}
 
@@ -526,6 +521,10 @@ int main(int argc, char const * argv[])
 		event_doc =
 			"See BIOS and Kernel Developer's Guide for AMD Family 15h Processors\n";
 		break;
+	case CPU_AMD64_GENERIC:
+		event_doc =
+			"See BIOS and Kernel Developer's Guide for AMD Processors\n";
+		break;
 	case CPU_ATHLON:
 		event_doc =
 			"See AMD Athlon Processor x86 Code Optimization Guide\n"
@@ -542,37 +541,24 @@ int main(int argc, char const * argv[])
 	case CPU_CORE_I7:
 	case CPU_NEHALEM:
 	case CPU_HASWELL:
+	case CPU_BROADWELL:
+	case CPU_SILVERMONT:
 	case CPU_WESTMERE:
 	case CPU_SANDYBRIDGE:
 	case CPU_IVYBRIDGE:
 	case CPU_ATOM:
 		event_doc =
 			"See Intel Architecture Developer's Manual Volume 3B, Appendix A and\n"
-			"Intel Architecture Optimization Reference Manual (730795-001)\n\n";
+			"Intel Architecture Optimization Reference Manual\n\n";
 		break;
 
 	case CPU_ARCH_PERFMON:
 		event_doc =
 			"See Intel 64 and IA-32 Architectures Software Developer's Manual\n"
-			"Volume 3B (Document 253669) Chapter 18 for architectural perfmon events\n"
+			"Volume 3B Chapter 18 for architectural perfmon events\n"
 			"This is a limited set of fallback events because oprofile doesn't know your CPU\n";
 		break;
 	
-	case CPU_IA64:
-	case CPU_IA64_1:
-	case CPU_IA64_2:
-		event_doc =
-			"See Intel Itanium Processor Reference Manual\n"
-			"for Software Development (Document 245320-003),\n"
-			"Intel Itanium Processor Reference Manual\n"
-			"for Software Optimization (Document 245473-003),\n"
-			"Intel Itanium 2 Processor Reference Manual\n"
-			"for Software Development and Optimization (Document 251110-001)\n\n";
-		break;
-	case CPU_AXP_EV4:
-	case CPU_AXP_EV5:
-	case CPU_AXP_PCA56:
-	case CPU_AXP_EV6:
 	case CPU_AXP_EV67:
 		event_doc =
 			"See Alpha Architecture Reference Manual\n"
@@ -612,6 +598,12 @@ int main(int argc, char const * argv[])
 			"Scorpion Processor Family Programmer's Reference Manual (PRM)\n";
 		break;
 
+	case CPU_ARM_KRAIT:
+		event_doc =
+			"See ARM Architecture Reference Manual ARMv7-A and ARMv7-R Edition\n"
+			"Krait Processor Family Programmer's Reference Manual (PRM)\n";
+		break;
+
 	case CPU_ARM_V7_CA9:
 		event_doc =
 			"See Cortex-A9 Technical Reference Manual\n"
@@ -636,10 +628,23 @@ int main(int argc, char const * argv[])
 			"Cortex A15 DDI (ARM DDI 0438F, revision r3p1)\n";
 		break;
 
-	case CPU_PPC64_PA6T:
+	case CPU_ARM_V8_APM_XGENE:
 		event_doc =
-			"See PA6T Power Implementation Features Book IV\n"
-			"Chapter 7 Performance Counters\n";
+			"See ARM Architecture Reference Manual \n"
+			"ARMv8, for ARMv8-A architecture profile\n"
+			"DDI (ARM DDI0487A.a)\n";
+		break;
+
+	case CPU_ARM_V8_CA57:
+		event_doc =
+			"See Cortex-A57 MPCore Technical Reference Manual\n"
+			"Cortex A57 DDI (ARM DDI 0488D, revision r1p1)\n";
+		break;
+
+	case CPU_ARM_V8_CA53:
+		event_doc =
+			"See Cortex-A53 MPCore Technical Reference Manual\n"
+			"Cortex A57 DDI (ARM DDI 0500D, revision r0p2)\n";
 		break;
 
 	case CPU_PPC64_POWER4:
@@ -650,7 +655,6 @@ int main(int argc, char const * argv[])
 	case CPU_PPC64_970:
 	case CPU_PPC64_970MP:
 	case CPU_PPC64_POWER7:
-	case CPU_PPC64_IBM_COMPAT_V1:
 		event_doc =
 			"When using operf, events may be specified without a '_GRP<n>' suffix.\n"
 			"If _GRP<n> (i.e., group number) is not specified, one will be automatically\n"
@@ -661,10 +665,11 @@ int main(int argc, char const * argv[])
 			"No public performance monitoring doc available for older processors.\n";
 		break;
 
-	case CPU_PPC64_CELL:
+	case CPU_PPC64_ARCH_V1:
+	case CPU_PPC64_POWER8:
 		event_doc =
-			"Obtain Cell Broadband Engine documentation at:\n"
-			"http://www-306.ibm.com/chips/techlib/techlib.nsf/products/Cell_Broadband_Engine\n";
+			"This processor type is fully supported with operf.\n"
+			"See Power ISA 2.07 at https://www.power.org/\n\n";
 		break;
 
 	case CPU_MIPS_20K:
@@ -737,6 +742,8 @@ int main(int argc, char const * argv[])
 
 	case CPU_PPC_E500:
 	case CPU_PPC_E500_2:
+	case CPU_PPC_E500MC:
+	case CPU_PPC_E6500:
 		event_doc =
 			"See PowerPC e500 Core Complex Reference Manual\n"
 			"Chapter 7: Performance Monitor\n"
@@ -757,14 +764,6 @@ int main(int argc, char const * argv[])
 			"Downloadable from http://www.freescale.com\n";
 		break;
 
-	case CPU_AVR32:
-		event_doc =
-			"See AVR32 Architecture Manual\n"
-			"Chapter 6: Performance Counters\n"
-			"http://www.atmel.com/dyn/resources/prod_documents/doc32000.pdf\n";
-
-		break;
-
 	case CPU_TILE_TILE64:
 	case CPU_TILE_TILEPRO:
 	case CPU_TILE_TILEGX:
@@ -779,20 +778,17 @@ int main(int argc, char const * argv[])
 	case CPU_S390_Z196:
 	case CPU_S390_ZEC12:
 		event_doc = "IBM System z CPU Measurement Facility\n"
-			"http://www-01.ibm.com/support/docview.wss"
-			"?uid=isg26fcd1cc32246f4c8852574ce0044734a\n";
+				"http://www-01.ibm.com/support/docview.wss"
+				"?uid=isg26fcd1cc32246f4c8852574ce0044734a\n";
 		break;
 
-		case CPU_RTC:
-			break;
-
-		// don't use default, if someone add a cpu he wants a compiler warning
-		// if he forgets to handle it here.
-		case CPU_TIMER_INT:
-		case CPU_NO_GOOD:
-		case MAX_CPU_TYPE:
-			printf("%d is not a valid processor type.\n", cpu_type);
-			exit(EXIT_FAILURE);
+	// don't use default, if someone add a cpu he wants a compiler warning
+	// if he forgets to handle it here.
+	case CPU_TIMER_INT:
+	case CPU_NO_GOOD:
+	case MAX_CPU_TYPE:
+		printf("%d is not a valid processor type.\n", cpu_type);
+		exit(EXIT_FAILURE);
 	}
 
 	sprintf(title, "oprofile: available events for CPU type \"%s\"\n\n", pretty);
@@ -801,7 +797,7 @@ int main(int argc, char const * argv[])
 	else {
 		printf("%s%s", title, event_doc);
 		printf("For architectures using unit masks, you may be able to specify\n"
-		       "unit masks by name.  See 'opcontrol' or 'operf' man page for more details.\n\n");
+		       "unit masks by name.  See 'operf' or 'ocount' man page for more details.\n\n");
 	}
 
 	list_for_each(pos, events) {

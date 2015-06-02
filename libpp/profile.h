@@ -20,7 +20,6 @@
 #include "odb.h"
 #include "op_types.h"
 #include "utility.h"
-#include "populate_for_spu.h"
 
 class opd_header;
 class op_bfd;
@@ -56,16 +55,6 @@ public:
 	static count_type sample_count(std::string const & filename);
 
 	/**
-	 * Indicate if given sample file is from a Cell Broadband Engine
-	 * SPU profile
-	 * @param filename sample filename
-	 *
-	 * Convenience interface put here so all access to samples files
-	 * go through profile_t static or non static member.
-	 */
-	static enum profile_type is_spu_sample_file(std::string const & filename);
-
-	/**
 	 * cumulate sample file to our container of samples
 	 * @param filename  sample file name
 	 *
@@ -77,6 +66,7 @@ public:
 
 	/// Set an appropriate start offset, see comments below.
 	void set_offset(op_bfd const & abfd);
+	u64 get_offset(void) const { return start_offset; }
 
 	class const_iterator;
 	typedef std::pair<const_iterator, const_iterator> iterator_pair;

@@ -36,6 +36,13 @@ struct bfd_info {
 	/// return true if BFD is readable
 	bool valid() const { return abfd; }
 
+	/* return true if the BFD is a pseudo file.  A pseudo BFD file is used
+	 * when the kernel symbols are obtained from /proc/kallsyms rather
+	 * then vmlinux.
+	 */
+	bool is_pseudo_bfd() const {
+	return (abfd == ((bfd *) 1)); }
+
 	/// return true if BFD has debug info
 	bool has_debug_info() const;
 
@@ -124,9 +131,6 @@ bfd * open_bfd(std::string const & file);
 
 /// open the given BFD from the fd
 bfd * fdopen_bfd(std::string const & file, int fd);
-
-/// Return a BFD for an SPU ELF embedded in PPE binary file
-bfd * spu_open_bfd(std::string const name, int fd, uint64_t offset_to_spu_elf);
 
 /// Return true if the symbol is worth looking at
 bool interesting_symbol(asymbol * sym);

@@ -27,7 +27,6 @@
 #include "profile.h"
 #include "op_bfd.h"
 #include "cverb.h"
-#include "populate_for_spu.h"
 
 using namespace std;
 
@@ -57,19 +56,6 @@ count_type profile_t::sample_count(string const & filename)
 }
 
 //static member
-enum profile_type profile_t::is_spu_sample_file(string const & filename)
-{
-	profile_type retval;
-	odb_t samples_db;
-	open_sample_file(filename, samples_db);
-	opd_header const & hdr =
-		*static_cast<opd_header *>(odb_get_data(&samples_db));
-	retval = hdr.spu_profile ? cell_spu_profile: normal_profile;
-	odb_close(&samples_db);
-	return retval;
-}
-
-//static member
 void profile_t::open_sample_file(string const & filename, odb_t & db)
 {
 	// Check first if the sample file version is ok else odb_open() can
@@ -78,9 +64,9 @@ void profile_t::open_sample_file(string const & filename, odb_t & db)
 
 	if (head.version != OPD_VERSION) {
 		ostringstream os;
-		os << "oprofpp: samples files version mismatch, are you "
-		   << "running a daemon and post-profile tools with version "
-		   <<  "mismatch ?\n";
+		os << "oprofpp: samples files version mismatch." << endl
+		   << "Be sure you are running the oprofile post-profile tool that" << endl
+		   << "matches the version of operf used to collect the profile" << endl;
 		throw op_fatal_error(os.str());
 	}
 

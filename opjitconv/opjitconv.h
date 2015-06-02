@@ -34,6 +34,14 @@
 #include "op_list.h"
 #include "op_types.h"
 
+#define verbprintf(x, args...) \
+        do { \
+                /* This is a bit fragile, but we must catch verbprintf("%s", "") */ \
+                if (x == 1) \
+                        printf(args); \
+        } while (0)
+
+
 /* Structure that contains all information
  * for one function entry in the jit dump file.
  * the jit dump file gets mmapped and code and
@@ -99,7 +107,7 @@ int parse_all(void const * start, void const * end,
 	      unsigned long long end_time);
 
 /* conversion.c */
-int op_jit_convert(struct op_jitdump_info file_info, char const * elffile,
+int op_jit_convert(struct op_jitdump_info *file_info, char const * elffile,
                    unsigned long long start_time, unsigned long long end_time);
 
 /* create_bfd.c */

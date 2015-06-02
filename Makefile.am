@@ -10,7 +10,6 @@ SUBDIRS = \
 	libutil++ \
 	libopt++ \
 	libabi \
-	daemon \
 	utils \
 	libregex \
 	libpp \
@@ -18,9 +17,10 @@ SUBDIRS = \
 	pp \
 	events \
 	doc \
-	gui \
+	libpe_utils \
 	libperf_events \
 	pe_profiling \
+	pe_counting \
 	agents
 #### ATTENTION ####
 #    The agents directory must be kept as the last subdir

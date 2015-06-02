@@ -21,7 +21,7 @@ static char buffer[MAX_BUFFER];
 
 void open_xml_events(char const * title, char const * doc, op_cpu the_cpu_type)
 {
-	char const * schema_version = "1.1";
+	char const * schema_version = "2.0";
 
 	buffer[0] = '\0';
 	cpu_type = the_cpu_type;
@@ -42,20 +42,6 @@ void close_xml_events(void)
 	printf("%s", buffer);
 }
 
-static void xml_do_arch_specific_event_help(struct op_event const *event,
-					    char *buffer, size_t size)
-{
-	switch (cpu_type) {
-	case CPU_PPC64_CELL:
-		init_xml_int_attr(HELP_EVENT_GROUP, event->val / 100, buffer,
-				  size);
-		break;
-	default:
-		break;
-	}
-}
-
-
 void xml_help_for_event(struct op_event const * event)
 {
 	uint i;
@@ -64,7 +50,6 @@ void xml_help_for_event(struct op_event const * event)
 	buffer[0] = '\0';
 	open_xml_element(HELP_EVENT, 1, buffer, MAX_BUFFER);
 	init_xml_str_attr(HELP_EVENT_NAME, event->name, buffer, MAX_BUFFER);
-	xml_do_arch_specific_event_help(event, buffer, MAX_BUFFER);
 	init_xml_str_attr(HELP_EVENT_DESC, event->desc, buffer, MAX_BUFFER);
 
 	init_xml_int_attr(HELP_COUNTER_MASK, event->counter_mask, buffer,
@@ -95,16 +80,16 @@ void xml_help_for_event(struct op_event const * event)
 		close_xml_element(NONE, 1, buffer, MAX_BUFFER);
 		for (i = 0; i < event->unit->num; i++) {
 			open_xml_element(HELP_UNIT_MASK, 1, buffer, MAX_BUFFER);
+			if (event->unit->um[i].name)
+				init_xml_str_attr(HELP_UNIT_MASK_NAME,
+					  event->unit->um[i].name,
+					  buffer, MAX_BUFFER);
 			init_xml_int_attr(HELP_UNIT_MASK_VALUE,
 					  event->unit->um[i].value,
 					  buffer, MAX_BUFFER);
 			init_xml_str_attr(HELP_UNIT_MASK_DESC,
 					  event->unit->um[i].desc,
 					  buffer, MAX_BUFFER);
-			if (event->unit->um[i].extra)
-				init_xml_int_attr(HELP_UNIT_EXTRA_VALUE,
-					          event->unit->um[i].extra,
-					          buffer, MAX_BUFFER);
 			close_xml_element(NONE, 0, buffer, MAX_BUFFER);
 		}
 		close_xml_element(HELP_UNIT_MASKS, 0, buffer, MAX_BUFFER);

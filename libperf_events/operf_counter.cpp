@@ -1,5 +1,5 @@
 /**
- * @file pe_profiling/operf_counter.cpp
+ * @file libperf_events/operf_counter.cpp
  * C++ class implementation that abstracts the user-to-kernel interface
  * for using Linux Performance Events Subsystem.
  *
@@ -11,7 +11,7 @@
  * (C) Copyright IBM Corp. 2011
  *
  * Modified by Maynard Johnson <maynardj@us.ibm.com>
- * (C) Copyright IBM Corporation 2012
+ * (C) Copyright IBM Corporation 2012, 2014
  *
 */
 
@@ -22,6 +22,7 @@
 #include <errno.h>
 #include <string.h>
 #include <iostream>
+#include <sstream>
 #include <stdlib.h>
 #include "op_events.h"
 #include "operf_counter.h"
@@ -30,6 +31,7 @@
 #include "operf_process_info.h"
 #include "op_libiberty.h"
 #include "operf_stats.h"
+#include "op_pe_utils.h"
 
 
 using namespace std;
@@ -37,7 +39,6 @@ using namespace OP_perf_utils;
 
 
 volatile bool quit;
-volatile bool read_quit;
 int sample_reads;
 int num_mmap_pages;
 unsigned int pagesize;
@@ -48,6 +49,8 @@ extern bool first_time_processing;
 extern bool throttled;
 extern size_t mmap_size;
 extern size_t pg_sz;
+extern bool use_cpu_minus_one;
+extern bool track_new_forks;
 
 namespace {
 
@@ -57,13 +60,31 @@ static const char *__op_magic = "OPFILE";
 
 #define OP_MAGIC	(*(u64 *)__op_magic)
 
+static bool _print_pp_progress(int fd)
+{
+	int msg;
+	if (read(fd, &msg, sizeof(msg)) > 0)
+		return true;
+	else
+		return false;
+}
 
-int _get_perf_event_from_pipe(event_t * event, int sample_data_fd)
+/* This function for reading an event from the sample data pipe must
+ * be robust enough to handle the situation where the operf_record process
+ * writes an event record to the pipe in multiple chunks.
+ */
+#define OP_PIPE_READ_OK 0
+#define OP_PIPE_CLOSED -1
+static int _get_perf_event_from_pipe(event_t * event, int sample_data_fd)
 {
 	static size_t pe_header_size = sizeof(perf_event_header);
+	size_t read_size = pe_header_size;
+	int rc = OP_PIPE_READ_OK;
 	char * evt = (char *)event;
 	ssize_t num_read;
 	perf_event_header * header = (perf_event_header *)event;
+
+	memset(header, '\0', pe_header_size);
 
 	/* A signal handler was setup for the operf_read process to handle interrupts
 	 * (i.e., from ctrl-C), so the read syscalls below may get interrupted.  But the
@@ -74,52 +95,87 @@ int _get_perf_event_from_pipe(event_t * event, int sample_data_fd)
 	 */
 again:
 	errno = 0;
-	if ((num_read = read(sample_data_fd, header, pe_header_size)) < 0) {
+	if ((num_read = read(sample_data_fd, header, read_size)) < 0) {
 		cverb << vdebug << "Read 1 of sample data pipe returned with " << strerror(errno) << endl;
-		if (errno == EINTR)
+		if (errno == EINTR) {
 			goto again;
-		else
-			return -1;
+		} else {
+			rc = OP_PIPE_CLOSED;
+			goto out;
+		}
 	} else if (num_read == 0) {
-		return -1;
+		// Implies pipe has been closed on the write end, so return -1 to quit reading
+		rc = OP_PIPE_CLOSED;
+		goto out;
+	} else if (num_read != (ssize_t)read_size) {
+		header += num_read;
+		read_size -= num_read;
+		goto again;
 	}
+
+	read_size = header->size - pe_header_size;
+	if (read_size == 0)
+		/* This is technically a valid record -- it's just empty. I'm not
+		 * sure if this can happen (i.e., if the kernel ever creates empty
+		 * records), but we'll handle it just in case.
+		 */
+		goto again;
+
+	if (!header->size || (header->size < pe_header_size))
+		/* Bogus header size detected. In this case, we don't set rc to -1,
+		 * because the caller will catch this error when it calls is_header_valid().
+		 * I've seen such bogus stuff occur when profiling lots of processes at
+		 * a very high sampling frequency. This issue is still being investigated,
+		 * so for now, we'll just do our best to detect and handle gracefully.
+		 */
+		goto out;
+
 	evt += pe_header_size;
-	if (!header->size)
-		return -1;
 
 again2:
-	if ((num_read = read(sample_data_fd, evt, header->size - pe_header_size)) < 0) {
+	if ((num_read = read(sample_data_fd, evt, read_size)) < 0) {
 		cverb << vdebug << "Read 2 of sample data pipe returned with " << strerror(errno) << endl;
-		if (errno == EINTR)
+		if (errno == EINTR) {
 			goto again2;
-		else
-			return -1;
+		} else {
+			rc = OP_PIPE_CLOSED;
+			if (errno == EFAULT)
+				cerr << "Size of event record: " << header->size << endl;
+			goto out;
+		}
 	} else if (num_read == 0) {
-		return -1;
+		// Implies pipe has been closed on the write end, so return -1 to quit reading
+		rc = OP_PIPE_CLOSED;
+		goto out;
+	} else if (num_read != (ssize_t)read_size) {
+		evt += num_read;
+		read_size -= num_read;
+		goto again2;
 	}
-	return 0;
+
+out:
+	return rc;
 }
 
-event_t * _get_perf_event_from_file(struct mmap_info & info)
+static event_t * _get_perf_event_from_file(struct mmap_info & info)
 {
-	uint32_t size;
+	uint32_t size = 0;
+	static int num_remaps = 0;
 	event_t * event;
-
-	if (info.offset + info.head >= info.file_data_offset + info.file_data_size)
-		return NULL;
-
-	if (!pg_sz)
-		pg_sz = sysconf(_SC_PAGESIZE);
+	size_t pe_header_size = sizeof(struct perf_event_header);
 
 try_again:
-	event = (event_t *)(info.buf + info.head);
+	event = NULL;
+	if (info.offset + info.head + pe_header_size > info.file_data_size)
+		goto out;
 
-	if ((mmap_size != info.file_data_size) &&
-			(((info.head + sizeof(event->header)) > mmap_size) ||
-					(info.head + event->header.size > mmap_size))) {
+	if (info.head + pe_header_size <= mmap_size)
+		event = (event_t *)(info.buf + info.head);
+
+	if (unlikely(!event || (info.head + event->header.size > mmap_size))) {
 		int ret;
 		u64 shift = pg_sz * (info.head / pg_sz);
-		cverb << vconvert << "Remapping perf data file" << endl;
+		cverb << vdebug << "Remapping perf data file: " << dec << ++num_remaps << endl;
 		ret = munmap(info.buf, mmap_size);
 		if (ret) {
 			string errmsg = "Internal error:  munmap of perf data file failed with errno: ";
@@ -139,23 +195,20 @@ try_again:
 	}
 
 	size = event->header.size;
-
-	// The tail end of the operf data file may be zero'ed out, so we assume if we
-	// find size==0, we're now in that area of the file, so we're done.
-	if (size == 0)
-		return NULL;
-
 	info.head += size;
-	if (info.offset + info.head >= info.file_data_offset + info.file_data_size)
-		return NULL;
-
+out:
+	if (unlikely(!event)) {
+		cverb << vdebug << "No more event records in file.  info.offset: " << dec << info.offset
+		      << "; info.head: " << info.head << "; info.file_data_size: " << info.file_data_size
+		      << endl << "; mmap_size: " << mmap_size  << "; current record size: " << size << endl;
+	}
 	return event;
 }
 
 }  // end anonymous namespace
 
 operf_counter::operf_counter(operf_event_t & evt,  bool enable_on_exec, bool do_cg,
-                             bool separate_cpu)
+                             bool separate_cpu, bool inherit, int event_number)
 {
 	memset(&attr, 0, sizeof(attr));
 	attr.size = sizeof(attr);
@@ -164,57 +217,67 @@ operf_counter::operf_counter(operf_event_t & evt,  bool enable_on_exec, bool do_
 		attr.sample_type |= PERF_SAMPLE_CALLCHAIN;
 	if (separate_cpu)
 		attr.sample_type |= PERF_SAMPLE_CPU;
+
+#ifdef __s390__
+	attr.type = PERF_TYPE_HARDWARE;
+#else
 	attr.type = PERF_TYPE_RAW;
-#if defined(__i386__) || defined(__x86_64__)
+#endif
+#if ((defined(__i386__) || defined(__x86_64__)) && (HAVE_PERF_PRECISE_IP))
 	if (evt.evt_code & EXTRA_PEBS) {
 		attr.precise_ip = 2;
 		evt.evt_code ^= EXTRA_PEBS;
 	}
 #endif
-	
+	attr.exclude_hv = evt.no_hv;
 	attr.config = evt.evt_code;
 	attr.sample_period = evt.count;
-	attr.inherit = 1;
+	attr.inherit = inherit ? 1 : 0;
 	attr.enable_on_exec = enable_on_exec ? 1 : 0;
 	attr.disabled  = 1;
 	attr.exclude_idle = 0;
 	attr.exclude_kernel = evt.no_kernel;
-	attr.exclude_hv = evt.no_hv;
 	attr.read_format = PERF_FORMAT_ID;
 	event_name = evt.name;
 	fd = id = -1;
+	evt_num = event_number;
 }
 
 operf_counter::~operf_counter() {
 }
 
 
-int operf_counter::perf_event_open(pid_t ppid, int cpu, unsigned event, operf_record * rec)
+int operf_counter::perf_event_open(pid_t pid, int cpu, operf_record * rec, bool print_error)
 {
 	struct {
 		u64 count;
 		u64 id;
 	} read_data;
 
-	if (event == 0) {
+	if (evt_num == 0) {
 		attr.mmap = 1;
 		attr.comm = 1;
 	}
-	fd = op_perf_event_open(&attr, ppid, cpu, -1, 0);
+	fd = op_perf_event_open(&attr, pid, cpu, -1, 0);
 	if (fd < 0) {
 		int ret = -1;
 		cverb << vrecord << "perf_event_open failed: " << strerror(errno) << endl;
 		if (errno == EBUSY) {
-			cerr << "The performance monitoring hardware reports EBUSY. Is another profiling tool in use?" << endl
-			     << "On some architectures, tools such as oprofile and perf being used in system-wide "
-			     << "mode can cause this problem." << endl;
+			if (print_error) {
+				cerr << "The performance monitoring hardware reports EBUSY. Is another profiling tool in use?" << endl
+				     << "On some architectures, tools such as oprofile and perf being used in system-wide "
+				     << "mode can cause this problem." << endl;
+			}
 			ret = OP_PERF_HANDLED_ERROR;
 		} else if (errno == ESRCH) {
-			cerr << "!!!! No samples collected !!!" << endl;
-			cerr << "The target program/command ended before profiling was started." << endl;
+			if (print_error) {
+				cerr << "!!!! No samples collected !!!" << endl;
+				cerr << "The target program/command ended before profiling was started." << endl;
+			}
 			ret = OP_PERF_HANDLED_ERROR;
 		} else {
-			cerr << "perf_event_open failed with " << strerror(errno) << endl;
+			if (print_error)
+				cerr << "perf_event_open failed with " << strerror(errno) << endl;
 		}
 		return ret;
 	}
@@ -222,7 +285,7 @@ int operf_counter::perf_event_open(pid_t ppid, int cpu, unsigned event, operf_re
 		perror("Error reading perf_event fd");
 		return -1;
 	}
-	rec->register_perf_event_id(event, read_data.id, attr);
+	rec->register_perf_event_id(evt_num, read_data.id, attr);
 
 	cverb << vrecord << "perf_event_open returning fd " << fd << endl;
 	return fd;
@@ -232,32 +295,38 @@ operf_record::~operf_record()
 {
 	cverb << vrecord << "operf_record::~operf_record()" << endl;
 	opHeader.data_size = total_bytes_recorded;
-	if (total_bytes_recorded)
+	// If recording to a file, we re-write the op_header info
+	// in order to update the data_size field.
+	if (total_bytes_recorded && write_to_file)
 		write_op_header_info();
 
 	if (poll_data)
 		delete[] poll_data;
-	close(output_fd);
-	for (int i = 0; i < samples_array.size(); i++) {
+	for (size_t i = 0; i < samples_array.size(); i++) {
 		struct mmap_data *md = &samples_array[i];
 		munmap(md->base, (num_mmap_pages + 1) * pagesize);
 	}
 	samples_array.clear();
 	evts.clear();
 	perfCounters.clear();
+	/* Close output_fd last. If sample data was being written to a pipe, we want
+	 * to give the pipe reader (i.e., operf_read::convertPerfData) as much time
+	 * as possible in order to drain the pipe of any remaining data.
+	 */
+	close(output_fd);
 }
 
 operf_record::operf_record(int out_fd, bool sys_wide, pid_t the_pid, bool pid_running,
                            vector<operf_event_t> & events, vmlinux_info_t vi, bool do_cg,
-bool separate_by_cpu, bool out_fd_is_file)
+                           bool separate_by_cpu, bool out_fd_is_file,
+                           int _convert_read_pipe, int _convert_write_pipe)
 {
-	int flags = O_CREAT|O_RDWR|O_TRUNC;
 	struct sigaction sa;
 	sigset_t ss;
 	vmlinux_file = vi.image_name;
 	kernel_start = vi.start;
 	kernel_end = vi.end;
-	pid = the_pid;
+	pid_to_profile = the_pid;
 	pid_started = pid_running;
 	system_wide = sys_wide;
 	callgraph = do_cg;
@@ -268,11 +337,13 @@ bool separate_by_cpu, bool out_fd_is_file)
 	valid = false;
 	poll_data = NULL;
 	output_fd = out_fd;
+	read_comm_pipe = _convert_read_pipe;
+	write_comm_pipe = _convert_write_pipe;
 	write_to_file = out_fd_is_file;
 	opHeader.data_size = 0;
 	num_cpus = -1;
 
-	if (system_wide && (pid != -1 || pid_started))
+	if (system_wide && (pid_to_profile != -1 || pid_started))
 		return;  // object is not valid
 
 	cverb << vrecord << "operf_record ctor using output fd " << output_fd << endl;
@@ -301,15 +372,21 @@ int operf_record::_write_header_to_file(void)
 	struct op_file_attr f_attr;
 	int total = 0;
 
-	lseek(output_fd, sizeof(f_header), SEEK_SET);
+	if (lseek(output_fd, sizeof(f_header), SEEK_SET) == (off_t)-1)
+		goto err_out;
+
 
 	for (unsigned i = 0; i < evts.size(); i++) {
 		opHeader.h_attrs[i].id_offset = lseek(output_fd, 0, SEEK_CUR);
+		if (opHeader.h_attrs[i].id_offset == (off_t)-1)
+			goto err_out;
 		total += op_write_output(output_fd, &opHeader.h_attrs[i].ids[0],
 		                         opHeader.h_attrs[i].ids.size() * sizeof(u64));
 	}
 
 	opHeader.attr_offset = lseek(output_fd, 0, SEEK_CUR);
+	if (opHeader.attr_offset == (off_t)-1)
+		goto err_out;
 
 	for (unsigned i = 0; i < evts.size(); i++) {
 		struct op_header_evt_info attr = opHeader.h_attrs[i];
@@ -320,6 +397,9 @@ int operf_record::_write_header_to_file(void)
 	}
 
 	opHeader.data_offset = lseek(output_fd, 0, SEEK_CUR);
+	if (opHeader.data_offset == (off_t)-1)
+		goto err_out;
+
 
 	f_header.magic = OP_MAGIC;
 	f_header.size = sizeof(f_header);
@@ -329,10 +409,17 @@ int operf_record::_write_header_to_file(void)
 	f_header.data.offset = opHeader.data_offset;
 	f_header.data.size = opHeader.data_size;
 
-	lseek(output_fd, 0, SEEK_SET);
+	if (lseek(output_fd, 0, SEEK_SET) == (off_t)-1)
+		goto err_out;
 	total += op_write_output(output_fd, &f_header, sizeof(f_header));
-	lseek(output_fd, opHeader.data_offset + opHeader.data_size, SEEK_SET);
+	if (lseek(output_fd, opHeader.data_offset + opHeader.data_size, SEEK_SET) == (off_t)-1)
+		goto err_out;
 	return total;
+
+err_out:
+	string errmsg = "Internal error doing lseek: ";
+	errmsg += strerror(errno);
+	throw runtime_error(errmsg);
 }
 
 int operf_record::_write_header_to_pipe(void)
@@ -369,8 +456,10 @@ void operf_record::register_perf_event_id(unsigned event, u64 id, perf_event_att
 	// is invoked once for each event for each cpu; but it's not worth the bother of trying
 	// to avoid it.
 	opHeader.h_attrs[event].attr = attr;
-	cverb << vrecord << "Perf header: id = " << hex << (unsigned long long)id << " for event num "
-			<< event << ", code " << attr.config <<  endl;
+	ostringstream message;
+	message  << "Perf header: id = " << hex << (unsigned long long)id << " for event num "
+	         << event << ", code " << attr.config <<  endl;
+	cverb << vrecord << message.str();
 	opHeader.h_attrs[event].ids.push_back(id);
 }
 
@@ -382,16 +471,19 @@ void operf_record::write_op_header_info()
 		add_to_total(_write_header_to_pipe());
 }
 
-int operf_record::prepareToRecord(int cpu, int fd)
+int operf_record::_prepare_to_record_one_fd(int idx, int fd)
 {
-	struct mmap_data md;;
+	struct mmap_data md;
 	md.prev = 0;
 	md.mask = num_mmap_pages * pagesize - 1;
 
-	fcntl(fd, F_SETFL, O_NONBLOCK);
+	if (fcntl(fd, F_SETFL, O_NONBLOCK) < 0) {
+		perror("fcntl failed");
+		return -1;
+	}
 
-	poll_data[cpu].fd = fd;
-	poll_data[cpu].events = POLLIN;
+	poll_data[idx].fd = fd;
+	poll_data[idx].events = POLLIN;
 	poll_count++;
 
 	md.base = mmap(NULL, (num_mmap_pages + 1) * pagesize,
@@ -414,6 +506,88 @@ int operf_record::prepareToRecord(int cpu, int fd)
 }
 
 
+int operf_record::prepareToRecord(void)
+{
+	int op_ctr_idx = 0;
+	int rc = 0;
+	errno = 0;
+	if (pid_started && (procs.size() > 1)) {
+		/* Implies we're profiling a thread group, where we call perf_event_open
+		 * on each thread (process) in the group, passing cpu=-1.  So we'll do
+		 * one mmap per thread (by way of the _prepare_to_record_one_fd function).
+		 * If more than one event has been specified to profile on, we just do an
+		 * ioctl PERF_EVENT_IOC_SET_OUTPUT to tie that perf_event fd with the fd
+		 * of the first event of the thread.
+		 */
+
+		// Sanity check
+		if ((procs.size() * evts.size()) != perfCounters.size()) {
+			cerr << "Internal error: Number of fds[] (" << perfCounters.size()
+			     << ") != number of processes x number of events ("
+			     << procs.size() << " x " << evts.size() << ")." << endl;
+			return -1;
+		}
+		for (unsigned int proc_idx = 0; proc_idx < procs.size(); proc_idx++) {
+			int fd_for_set_output = perfCounters[op_ctr_idx].get_fd();
+			for (unsigned event = 0; event < evts.size(); event++) {
+				int fd =  perfCounters[op_ctr_idx].get_fd();
+				if (event == 0) {
+					rc = _prepare_to_record_one_fd(proc_idx, fd);
+				} else {
+					if ((rc = ioctl(fd, PERF_EVENT_IOC_SET_OUTPUT,
+					                fd_for_set_output)) < 0)
+						perror("prepareToRecord: ioctl #1 failed");
+				}
+
+				if (rc < 0)
+					return rc;
+
+				if ((rc = ioctl(fd, PERF_EVENT_IOC_ENABLE)) < 0) {
+					perror("prepareToRecord: ioctl #2 failed");
+					return rc;
+				}
+				op_ctr_idx++;
+			}
+		}
+	} else {
+		/* We're either doing a system-wide profile or a profile of a single process.
+		 * We'll do one mmap per cpu.  If more than one event has been specified
+		 * to profile on, we just do an ioctl PERF_EVENT_IOC_SET_OUTPUT to tie
+		 * that perf_event fd with the fd of the first event of the cpu.
+		 */
+		if ((num_cpus * evts.size()) != perfCounters.size()) {
+			cerr << "Internal error: Number of fds[] (" << perfCounters.size()
+			     << ") != number of cpus x number of events ("
+			     << num_cpus << " x " << evts.size() << ")." << endl;
+			return -1;
+		}
+		for (int cpu = 0; cpu < num_cpus; cpu++) {
+			int fd_for_set_output = perfCounters[op_ctr_idx].get_fd();
+			for (unsigned event = 0; event < evts.size(); event++) {
+				int fd = perfCounters[op_ctr_idx].get_fd();
+				if (event == 0) {
+					rc = _prepare_to_record_one_fd(cpu, fd);
+				} else {
+					if ((rc = ioctl(fd, PERF_EVENT_IOC_SET_OUTPUT,
+					                fd_for_set_output)) < 0)
+						perror("prepareToRecord: ioctl #3 failed");
+				}
+
+				if (rc < 0)
+					return rc;
+
+				if ((rc = ioctl(fd, PERF_EVENT_IOC_ENABLE)) < 0) {
+					perror("prepareToRecord: ioctl #4 failed");
+					return rc;
+				}
+				op_ctr_idx++;
+			}
+		}
+	}
+	return rc;
+}
+
+
 void operf_record::setup()
 {
 	bool all_cpus_avail = true;
@@ -421,8 +595,8 @@ void operf_record::setup()
 	struct dirent *entry = NULL;
 	DIR *dir = NULL;
 	string err_msg;
-	char cpus_online[129];
-	bool need_IOC_enable = (system_wide || pid_started);
+	char cpus_online[257];
+	bool profile_process_group = false;
 
 
 	if (system_wide)
@@ -430,32 +604,34 @@ void operf_record::setup()
 	else
 		cverb << vrecord << "operf_record::setup() with pid_started = " << pid_started << endl;
 
-	if (!system_wide && pid_started) {
-		/* We need to verify the existence of the passed PID before trying
-		 * perf_event_open or all hell will break loose.
-		 */
-		char fname[PATH_MAX];
-		FILE *fp;
-		snprintf(fname, sizeof(fname), "/proc/%d/status", pid);
-		fp = fopen(fname, "r");
-		if (fp == NULL) {
-			// Process must have finished or invalid PID passed into us.
-			// We'll bail out now.
-			cerr << "Unable to find process information for PID " << pid << "." << endl;
-			cverb << vrecord << "couldn't open " << fname << endl;
-			return;
+	if (pid_started || system_wide) {
+		if ((rc = op_get_process_info(system_wide, pid_to_profile, this)) < 0) {
+			if (rc == OP_PERF_HANDLED_ERROR)
+				return;
+			else
+				throw runtime_error("Unexpected error in operf_record setup");
 		}
-		fclose(fp);
+		// 'pid_started && (procs.size() > 1)' implies the process that the user
+		// has requested us to profile has cloned one or more children.
+		profile_process_group = pid_started && (procs.size() > 1);
 	}
+
 	pagesize = sysconf(_SC_PAGE_SIZE);
-	num_mmap_pages = (512 * 1024)/pagesize;
-	num_cpus = sysconf(_SC_NPROCESSORS_ONLN);
-	if (!num_cpus)
-		throw runtime_error("Number of online CPUs is zero; cannot continue");;
+	// If profiling a process group, use a smaller mmap length to avoid EINVAL.
+	num_mmap_pages = profile_process_group ? 1 : (512 * 1024)/pagesize;
 
-	poll_data = new struct pollfd [num_cpus];
+	/* To set up to profile an existing thread group, we need call perf_event_open
+	 * for each thread, and we need to pass cpu=-1 on the syscall.
+	 */
+	use_cpu_minus_one = use_cpu_minus_one ? true : profile_process_group;
+	num_cpus = use_cpu_minus_one ? 1 : sysconf(_SC_NPROCESSORS_ONLN);
+	if (num_cpus < 1) {
+		char int_str[256];
+		sprintf(int_str, "Number of online CPUs is %d; cannot continue", num_cpus);
+		throw runtime_error(int_str);
+	}
 
-	cverb << vrecord << "calling perf_event_open for pid " << pid << " on "
+	cverb << vrecord << "calling perf_event_open for pid " << pid_to_profile << " on "
 	      << num_cpus << " cpus" << endl;
 	FILE * online_cpus = fopen("/sys/devices/system/cpu/online", "r");
 	if (!online_cpus) {
@@ -464,15 +640,14 @@ void operf_record::setup()
 		goto error;
 	}
 	memset(cpus_online, 0, sizeof(cpus_online));
-	fgets(cpus_online, sizeof(cpus_online), online_cpus);
-	if (!cpus_online[0]) {
+	if (fgets(cpus_online, sizeof(cpus_online), online_cpus) == NULL) {
 		fclose(online_cpus);
 		err_msg = "Internal Error: Number of online cpus cannot be determined.";
 		rc = -1;
 		goto error;
 
 	}
-	if (index(cpus_online, ',')) {
+	if (index(cpus_online, ',') || cpus_online[0] != '0') {
 		all_cpus_avail = false;
 		if ((dir = opendir("/sys/devices/system/cpu")) == NULL) {
 			fclose(online_cpus);
@@ -485,62 +660,73 @@ void operf_record::setup()
 
 	for (int cpu = 0; cpu < num_cpus; cpu++) {
 		int real_cpu;
-		int mmap_fd;
-		bool mmap_done_for_cpu = false;
-		if (all_cpus_avail) {
+		if (use_cpu_minus_one) {
+			real_cpu = -1;
+		} else if (all_cpus_avail) {
 			real_cpu = cpu;
 		} else {
-			real_cpu = op_get_next_online_cpu(dir, entry);
+			real_cpu = op_pe_utils::op_get_next_online_cpu(dir, entry);
 			if (real_cpu < 0) {
 				err_msg = "Internal Error: Number of online cpus cannot be determined.";
 				rc = -1;
 				goto error;
 			}
 		}
-
-		// Create new row to hold operf_counter objects since we need one
-		// row for each cpu. Do the same for samples_array.
-		vector<operf_counter> tmp_pcvec;
-
-		perfCounters.push_back(tmp_pcvec);
-		for (unsigned event = 0; event < evts.size(); event++) {
-			evts[event].counter = event;
-			perfCounters[cpu].push_back(operf_counter(evts[event],
-			                                          (!pid_started && !system_wide),
-			                                          callgraph, separate_cpu));
-			if ((rc = perfCounters[cpu][event].perf_event_open(pid, real_cpu, event, this)) < 0) {
-				err_msg = "Internal Error.  Perf event setup failed.";
-				goto error;
-			}
-			if (!mmap_done_for_cpu) {
-				if (((rc = prepareToRecord(cpu, perfCounters[cpu][event].get_fd()))) < 0) {
+		size_t num_procs = profile_process_group ? procs.size() : 1;
+		/* To profile a parent and its children, the perf_events kernel subsystem
+		 * requires us to use cpu=-1 on the perf_event_open call for each of the
+		 * processes in the group.  But perf_events also prevents us from specifying
+		 * "inherit" on the perf_event_attr we pass to perf_event_open when cpu is '-1'.
+		 */
+		bool inherit = !profile_process_group;
+		std::map<u32, struct comm_event>::iterator proc_it = procs.begin();
+		for (unsigned proc_idx = 0; proc_idx < num_procs; proc_idx++) {
+			for (unsigned event = 0; event < evts.size(); event++) {
+				/* For a parent process, comm.tid==comm.pid, but for child
+				 * processes in a process group, comm.pid is the parent, so
+				 * we must use comm.tid for the perf_event_open call.  So
+				 * we can use comm.tid for all cases.
+				 */
+				pid_t pid_for_open;
+				if (profile_process_group)
+					pid_for_open = proc_it++->second.tid;
+				else
+					pid_for_open = pid_to_profile;
+				operf_counter op_ctr(operf_counter(evts[event],
+				                                   (!pid_started && !system_wide),
+				                                   callgraph, separate_cpu,
+				                                   inherit, event));
+				if ((rc = op_ctr.perf_event_open(pid_for_open,
+				                                 real_cpu, this, true)) < 0) {
 					err_msg = "Internal Error.  Perf event setup failed.";
 					goto error;
 				}
-				mmap_fd = perfCounters[cpu][event].get_fd();
-				mmap_done_for_cpu = true;
-			} else {
-				if (ioctl(perfCounters[cpu][event].get_fd(),
-				          PERF_EVENT_IOC_SET_OUTPUT, mmap_fd) < 0)
-					goto error;
+				perfCounters.push_back(op_ctr);
 			}
-			if (need_IOC_enable)
-				if (ioctl(perfCounters[cpu][event].get_fd(), PERF_EVENT_IOC_ENABLE) < 0)
-					goto error;
 		}
 	}
-	if (dir)
-		closedir(dir);
+	int num_mmaps;
+	if (pid_started && (procs.size() > 1))
+		num_mmaps = procs.size();
+	else
+		num_mmaps = num_cpus;
+	poll_data = new struct pollfd [num_mmaps];
+	if ((rc = prepareToRecord()) < 0) {
+		err_msg = "Internal Error.  Perf event setup failed.";
+		goto error;
+	}
 	write_op_header_info();
 
 	// Set bit to indicate we're set to go.
 	valid = true;
+	if (dir)
+		closedir(dir);
 	return;
 
 error:
 	delete[] poll_data;
 	poll_data = NULL;
-	for (int i = 0; i < samples_array.size(); i++) {
+	for (size_t i = 0; i < samples_array.size(); i++) {
 		struct mmap_data *md = &samples_array[i];
 		munmap(md->base, (num_mmap_pages + 1) * pagesize);
 	}
@@ -552,25 +738,113 @@ error:
 		throw runtime_error(err_msg);
 }
 
+void operf_record::record_process_info(void)
+{
+	map<unsigned int, unsigned int> pids_mapped;
+	pid_t last_tgid = -1;
+	std::map<u32, struct comm_event>::iterator proc_it = procs.begin();
+	for (unsigned int proc_idx = 0; proc_idx < procs.size(); proc_idx++, proc_it++)
+	{
+		struct comm_event ce = proc_it->second;
+		int num = OP_perf_utils::op_write_output(output_fd, &ce, ce.header.size);
+		add_to_total(num);
+		if (cverb << vrecord)
+			cout << "Created COMM event for " << ce.comm << endl;
+
+		if (((pid_t)(ce.pid) == last_tgid) ||
+				(pids_mapped.find(ce.pid) != pids_mapped.end()))
+			continue;
+		OP_perf_utils::op_record_process_exec_mmaps(ce.tid,
+		                                            ce.pid,
+		                                            output_fd, this);
+		pids_mapped[ce.pid] = last_tgid = ce.pid;
+	}
+}
+
+int operf_record::_start_recoding_new_thread(pid_t id)
+{
+	string err_msg;
+	int num_mmaps, rc, fd_for_set_output = -1;
+	struct comm_event ce;
+	u64 sample_id;
+	struct pollfd * old_polldata = poll_data;
+
+	num_mmaps = sizeof(poll_data)/sizeof(poll_data[0]);
+	num_mmaps++;
+	poll_data = new struct pollfd [num_mmaps];
+	// Copy only the existing pollfd objects from the array.  The new pollfd will
+	// be filled in via the call to _prepare_to_record_one_fd.
+	for (int i = 0; i < num_mmaps - 1; i++)
+		poll_data[i] = old_polldata[i];
+	delete[] old_polldata;
+	// Make a pseudo comm_event object.  At this point, the
+	// only field we need to set is tid.
+	memset(&ce, 0, sizeof(ce));
+	ce.tid = id;
+	add_process(ce);
+
+	for (unsigned event = 0; event < evts.size(); event++) {
+		operf_counter op_ctr(operf_counter(evts[event],
+		                                   (!pid_started && !system_wide),
+		                                   callgraph, separate_cpu,
+		                                   false, event));
+		if (op_ctr.perf_event_open(id, -1, this, false) < 0) {
+			sample_id = OP_PERF_NO_SAMPLE_ID;
+			// Send special value to convert process to indicate failure
+			ssize_t len = write(write_comm_pipe, &sample_id, sizeof(sample_id));
+			if (len < 0)
+				perror("Internal error on convert write_comm_pipe");
+			return -1;
+		}
+		perfCounters.push_back(op_ctr);
+		int fd = op_ctr.get_fd();
+		if (event == 0) {
+			rc = _prepare_to_record_one_fd(num_mmaps - 1, fd);
+			fd_for_set_output = fd;
+		} else {
+			if ((rc = ioctl(fd, PERF_EVENT_IOC_SET_OUTPUT,
+			                fd_for_set_output)) < 0)
+				perror("_start_recoding_new_thread: ioctl #1 failed");
+		}
+
+		if (rc < 0)
+			return rc;
+
+		if ((rc = ioctl(fd, PERF_EVENT_IOC_ENABLE)) < 0) {
+			perror("_start_recoding_new_thread: ioctl #2 failed");
+			return rc;
+		}
+
+		sample_id = opHeader.h_attrs[event].ids.back();
+		ssize_t len = write(write_comm_pipe, &sample_id, sizeof(sample_id));
+		if (len < 0)
+			perror("Internal error on convert write_comm_pipe");
+		else if (len != sizeof(sample_id))
+			cerr << "Incomplete write convert to write_comm_pipe" << endl;
+		else
+			cverb << vrecord << "Sent sample_id " << sample_id << " to convert process" << endl;
+	}
+
+	return 0;
+}
+
+
 void operf_record::recordPerfData(void)
 {
 	bool disabled = false;
-	if (pid_started || system_wide) {
-		if (op_record_process_info(system_wide, pid, this, output_fd) < 0) {
-			for (int i = 0; i < num_cpus; i++) {
-				for (unsigned int evt = 0; evt < evts.size(); evt++)
-					ioctl(perfCounters[i][evt].get_fd(), PERF_EVENT_IOC_DISABLE);
-			}
-			throw runtime_error("operf_record: error recording process info");
-		}
-	}
-	op_record_kernel_info(vmlinux_file, kernel_start, kernel_end, output_fd, this);
+	if (pid_started || system_wide)
+		record_process_info();
+	else
+		op_get_vsyscall_mapping(pid_to_profile, output_fd, this);
 
+	op_record_kernel_info(vmlinux_file, kernel_start, kernel_end, output_fd, this);
+	cerr << "operf: Profiler started" << endl;
 	while (1) {
 		int prev = sample_reads;
+		pid_t pi;
+		ssize_t len;
 
-
-		for (int i = 0; i < samples_array.size(); i++) {
+		for (size_t i = 0; i < samples_array.size(); i++) {
 			if (samples_array[i].base)
 				op_get_kernel_event_data(&samples_array[i], this);
 		}
@@ -578,47 +852,46 @@ void operf_record::recordPerfData(void)
 			break;
 
 		if (prev == sample_reads) {
-			poll(poll_data, poll_count, -1);
+			(void)poll(poll_data, poll_count, -1);
+		}
+		if (!quit && track_new_forks && procs.size() > 1) {
+			len = read(read_comm_pipe, &pi, sizeof(pi));
+
+			if (len < 0 && errno != EAGAIN) {
+				cverb << vrecord << "Non-fatal error: read_comm_pipe returned too few bytes" << endl;
+			} else if (len == sizeof(pi) && (procs.find(pi) == procs.end())) {
+				// Start profiling this new thread
+				cverb << vrecord << "Start recording for new thread " << pi << endl;
+				// Don't treat as fatal error if it doesn't work
+				if (_start_recoding_new_thread(pi) < 0)
+					cerr << "Unable to collect samples for forked process " << pi
+					     << ". Process may have ended before recording could be started." << endl;
+			}
 		}
 
 		if (quit) {
-			for (int i = 0; i < num_cpus; i++) {
-				for (unsigned int evt = 0; evt < evts.size(); evt++)
-					ioctl(perfCounters[i][evt].get_fd(), PERF_EVENT_IOC_DISABLE);
-			}
+			for (unsigned int i = 0; i < perfCounters.size(); i++)
+				ioctl(perfCounters[i].get_fd(), PERF_EVENT_IOC_DISABLE);
 			disabled = true;
 			cverb << vrecord << "operf_record::recordPerfData received signal to quit." << endl;
 		}
 	}
+
 	cverb << vdebug << "operf recording finished." << endl;
 }
 
 void operf_read::init(int sample_data_pipe_fd, string input_filename, string samples_loc, op_cpu cputype,
-                      vector<operf_event_t> & events, bool systemwide)
+                      bool systemwide, int _record_write_pipe, int _record_read_pipe,
+                      int _post_profiling_pipe)
 {
-	struct sigaction sa;
-	sigset_t ss;
 	sample_data_fd = sample_data_pipe_fd;
+	read_comm_pipe = _record_read_pipe;
+	write_comm_pipe = _record_write_pipe;
+	post_profiling_pipe = _post_profiling_pipe;
 	inputFname = input_filename;
 	sampledir = samples_loc;
-	evts = events;
 	cpu_type = cputype;
 	syswide = systemwide;
-	memset(&sa, 0, sizeof(struct sigaction));
-	sa.sa_sigaction = op_perfread_sigusr1_handler;
-	sigemptyset(&sa.sa_mask);
-	sigemptyset(&ss);
-	sigaddset(&ss, SIGUSR1);
-	sigprocmask(SIG_UNBLOCK, &ss, NULL);
-	sa.sa_mask = ss;
-	sa.sa_flags = SA_NOCLDSTOP | SA_SIGINFO;
-	cverb << vconvert << "operf-read calling sigaction" << endl;
-	if (sigaction(SIGUSR1, &sa, NULL) == -1) {
-		cverb << vconvert << "operf-read init: sigaction failed; errno is: "
-		      << strerror(errno) << endl;
-		_exit(EXIT_FAILURE);
-	}
-
 }
 
 operf_read::~operf_read()
@@ -626,6 +899,11 @@ operf_read::~operf_read()
 	evts.clear();
 }
 
+void operf_read::add_sample_id_to_opHeader(u64 sample_id)
+{
+	for (unsigned int i = 0; i < evts.size(); i++)
+		opHeader.h_attrs[i].ids.push_back(sample_id);
+}
 
 int operf_read::_read_header_info_with_ifstream(void)
 {
@@ -680,7 +958,9 @@ int operf_read::_read_header_info_with_ifstream(void)
 				ret = OP_PERF_HANDLED_ERROR;
 				goto out;
 			}
-			cverb << vconvert << "Perf header: id = " << hex << (unsigned long long)perf_id << endl;
+			ostringstream message;
+			message << "Perf header: id = " << hex << (unsigned long long)perf_id << endl;
+			cverb << vconvert << message.str();
 			opHeader.h_attrs[i].ids.push_back(perf_id);
 		}
 		istrm.seekg(next_f_attr, ios_base::beg);
@@ -770,7 +1050,9 @@ int operf_read::_read_perf_header_from_pipe(void)
 				errmsg = "Error reading perf ID on sample data pipe: " + string(strerror(errno));
 				goto fail;
 			}
-			cverb << vconvert << "Perf header: id = " << hex << (unsigned long long)perf_id << endl;
+			ostringstream message;
+			message << "Perf header: id = " << hex << (unsigned long long)perf_id << endl;
+			cverb << vconvert << message.str();
 			opHeader.h_attrs[i].ids.push_back(perf_id);
 		}
 
@@ -804,21 +1086,32 @@ int operf_read::get_eventnum_by_perf_event_id(u64 id) const
 	return -1;
 }
 
-int operf_read::convertPerfData(void)
+
+unsigned int operf_read::convertPerfData(void)
 {
-	int num_bytes = 0;
+	unsigned int num_bytes = 0;
 	struct mmap_info info;
-	event_t * event;
+	bool error = false;
+	event_t * event = NULL;
+
+	if (fcntl(post_profiling_pipe, F_SETFL, O_NONBLOCK) < 0) {
+		cerr << "Error: fcntl failed with errno:\n\t" << strerror(errno) << endl;
+		throw runtime_error("Error: Unable to set post_profiling_pipe to non blocking");
+	}
 
 	if (!inputFname.empty()) {
 		info.file_data_offset = opHeader.data_offset;
 		info.file_data_size = opHeader.data_size;
+		cverb << vdebug << "Expecting to read approximately " << dec
+		      << info.file_data_size - info.file_data_offset
+		      << " bytes from operf sample data file." << endl;
 		info.traceFD = open(inputFname.c_str(), O_RDONLY);
 		if (info.traceFD == -1) {
 			cerr << "Error: open failed with errno:\n\t" << strerror(errno) << endl;
 			throw runtime_error("Error: Unable to open operf data file");
 		}
 		cverb << vdebug << "operf_read opened " << inputFname << endl;
+		pg_sz = sysconf(_SC_PAGESIZE);
 		if (op_mmap_trace_file(info, true) < 0) {
 			close(info.traceFD);
 			throw runtime_error("Error: Unable to mmap operf data file");
@@ -832,13 +1125,15 @@ int operf_read::convertPerfData(void)
 	for (int i = 0; i < OPERF_MAX_STATS; i++)
 		operf_stats[i] = 0;
 
-	cverb << vdebug << "Converting operf data to oprofile sample data format" << endl;
-	cverb << vdebug << "sample type is " << hex <<  opHeader.h_attrs[0].attr.sample_type << endl;
+	ostringstream message;
+	message << "Converting operf data to oprofile sample data format" << endl;
+	message << "sample type is " << hex <<  opHeader.h_attrs[0].attr.sample_type << endl;
+	cverb << vdebug << message.str();
 	first_time_processing = true;
 	int num_recs = 0;
+	struct perf_event_header last_header;
 	bool print_progress = !inputFname.empty() && syswide;
-	if (print_progress)
-		cerr << "Converting profile data to OProfile format" << endl;
+	bool printed_progress_msg = false;
 	while (1) {
 		streamsize rec_size = 0;
 		if (!inputFname.empty()) {
@@ -850,20 +1145,45 @@ int operf_read::convertPerfData(void)
 				break;
 		}
 		rec_size = event->header.size;
-		op_write_event(event, opHeader.h_attrs[0].attr.sample_type);
+
+		if ((!is_header_valid(event->header)) ||
+				((op_write_event(event, opHeader.h_attrs[0].attr.sample_type)) < 0)) {
+			error = true;
+			last_header = event->header;
+			break;
+		}
 		num_bytes += rec_size;
 		num_recs++;
-		if ((num_recs % 1000000 == 0) && print_progress)
+		if ((num_recs % 1000000 == 0) && (print_progress || _print_pp_progress(post_profiling_pipe))) {
+			if (!printed_progress_msg) {
+				cerr << "\nConverting profile data to OProfile format " << endl;
+				printed_progress_msg = true;
+			}
 			cerr << ".";
+		}
 	}
-	if (print_progress)
-		cerr << endl;
+	if (unlikely(error)) {
+		if (!inputFname.empty()) {
+			cerr << "ERROR: operf_read::convertPerfData quitting. Bad data read from file." << endl;
+		} else {
+			cerr << "ERROR: operf_read::convertPerfData quitting. Bad data read from pipe." << endl;
+			cerr << "Closing read end of data pipe. operf-record process will stop with SIGPIPE (13)."
+			     << endl;
+		}
+		cerr << "Try lowering the sample frequency to avoid this error; e.g., double the 'count'"
+		     << endl << "value in your event specification." << endl;
+		cverb << vdebug << "Event header type: " << last_header.type << "; size: " << last_header.size << endl;
+	}
 
 	first_time_processing = false;
-	op_reprocess_unresolved_events(opHeader.h_attrs[0].attr.sample_type);
+	if (!error)
+		op_reprocess_unresolved_events(opHeader.h_attrs[0].attr.sample_type, print_progress);
+
+	if (printed_progress_msg)
+		cerr << endl;
 
 	op_release_resources();
-	operf_print_stats(operf_options::session_dir, start_time_human_readable, throttled);
+	operf_print_stats(operf_options::session_dir, start_time_human_readable, throttled, evts);
 
 	char * cbuf;
 	cbuf = (char *)xmalloc(operf_options::session_dir.length() + 5);

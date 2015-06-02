@@ -24,7 +24,7 @@
 #include "profile_container.h"
 #include "sample_container.h"
 #include "symbol_container.h"
-#include "populate_for_spu.h"
+#include "cverb.h"
 
 using namespace std;
 
@@ -75,7 +75,7 @@ void profile_container::add(profile_t const & profile,
                             size_t pclass)
 {
 	string const image_name = abfd.get_filename();
-	opd_header header = profile.get_header();
+	count_type sym_count_total = 0;
 
 	for (symbol_index_t i = 0; i < abfd.syms.size(); ++i) {
 
@@ -92,6 +92,7 @@ void profile_container::add(profile_t const & profile,
 		if (count == 0)
 			continue;
 
+		sym_count_total += count;
 		symb_entry.sample.counts[pclass] = count;
 		total_count[pclass] += count;
 
@@ -115,18 +116,23 @@ void profile_container::add(profile_t const & profile,
 		symb_entry.app_name = image_names.create(app_name);
 
 		symb_entry.sample.vma = abfd.syms[i].vma();
-		if ((header.spu_profile == cell_spu_profile) &&
-		    header.embedded_offset) {
-			symb_entry.spu_offset = header.embedded_offset;
-			symb_entry.embedding_filename =
-				image_names.create(abfd.get_embedding_filename());
-		} else {
-			symb_entry.spu_offset = 0;
-		}
 		symbol_entry const * symbol = symbols->insert(symb_entry);
 
 		if (need_details)
 			add_samples(abfd, i, p_it, symbol, pclass, start);
+	}
+
+	if (cverb << vdebug) {
+		profile_t::iterator_pair summary_it =
+			profile.samples_range(profile.get_offset(), ~0ULL);
+		count_type module_summary_count = accumulate(summary_it.first, summary_it.second, 0ull);
+		if (sym_count_total < module_summary_count)
+			cout << "INFO: Sample counts differ:  Module summary count: " << dec
+			     << module_summary_count << "; total symbols count: " << sym_count_total
+			     << endl << "\timage name: " << image_name << endl;
+		else if (module_summary_count < sym_count_total)
+			cout << "Warning: Number of samples for module unexpectedly less than total "
+			     "symbols count!"  << endl << "\timage name: " << image_name << endl;
 	}
 }
 
@@ -177,13 +183,16 @@ profile_container::select_symbols(symbol_choice & choice) const
 		    && (image_names.name(it->image_name) != choice.image_name))
 			continue;
 
-		double const percent =
-			op_ratio(it->sample.counts[0], total_count[0]);
+		for (size_t j = 0; j < total_count.size(); j++) {
+			double const percent =
+					op_ratio(it->sample.counts[j], total_count[j]);
 
-		if (percent >= threshold) {
-			result.push_back(&*it);
+			if (percent >= threshold) {
+				result.push_back(&*it);
 
-			choice.hints = it->output_hint(choice.hints);
+				choice.hints = it->output_hint(choice.hints);
+				break;
+			}
 		}
 	}
 
@@ -220,9 +229,13 @@ profile_container::select_filename(double threshold) const
 		// FIXME: is samples_count() the right interface now ?
 		count_array_t counts = samples_count(*it);
 
-		double const ratio = op_ratio(counts[0], total_count[0]);
-		filename_by_samples const f(*it, ratio);
-
+		double highest_ratio = 0.0;
+		for (size_t j = 0; j < total_count.size(); j++ ) {
+			double const ratio = op_ratio(counts[j], total_count[j]);
+			if (ratio > highest_ratio)
+				highest_ratio = ratio;
+		}
+		filename_by_samples const f(*it, highest_ratio);
 		file_by_samples.push_back(f);
 	}
 

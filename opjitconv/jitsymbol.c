@@ -15,7 +15,6 @@
  */
 
 #include "opjitconv.h"
-#include "opd_printf.h"
 #include "op_libiberty.h"
 #include "op_types.h"
 
@@ -202,6 +201,26 @@ static void invalidate_earlybirds(unsigned long long start_time)
 	}
 }
 
+static void invalidate_zero_size_entries(void)
+{
+	u32 i;
+	int flag;
+	struct jitentry * a;
+
+	flag = 0;
+	for (i = 0; i < entry_count; i++) {
+		a = entries_address_ascending[i];
+		if (a->code_size == 0) {
+			invalidate_entry(a);
+			flag = 1;
+		}
+	}
+	if (flag) {
+		resort_address();
+		resort_symbol();
+	}
+}
+
 
 /* select the symbol with the longest life time in the index range */
 static int select_one(int start_idx, int end_idx)
@@ -375,7 +394,7 @@ static int handle_overlap_region(int start_idx, int end_idx)
 	int cnt;
 	char * name;
 	int i, j;
-	unsigned long long totaltime;
+	unsigned long long totaltime, pct;
 
 	if (debug) {
 		for (i = start_idx; i <= end_idx; i++) {
@@ -389,23 +408,28 @@ static int handle_overlap_region(int start_idx, int end_idx)
 		}
 	}
 	idx = select_one(start_idx, end_idx);
+	// This can't happen, but we check anyway, just to silence Coverity
+	if (idx == OP_JIT_CONV_FAIL) {
+		rc = OP_JIT_CONV_FAIL;
+		goto out;
+	}
 	totaltime = eliminate_overlaps(start_idx, end_idx, idx);
 	if (totaltime == ULONG_MAX) {
 		rc = OP_JIT_CONV_FAIL;
 		goto out;
 	}
 	e = entries_address_ascending[idx];
+	pct = (totaltime == 0) ? 100 : (e->life_end - e->life_start) * 100 / totaltime;
 
 	cnt = 1;
-	j = (e->life_end - e->life_start) * 100 / totaltime;
+	j = pct;
 	while ((j = j/10))
 		cnt++;
 
 	// Mark symbol name with a %% to indicate the overlap.
 	cnt += strlen(e->symbol_name) + 2 + 1;
 	name = xmalloc(cnt);
-	snprintf(name, cnt, "%s%%%llu", e->symbol_name,
-		 (e->life_end - e->life_start) * 100 / totaltime);
+	snprintf(name, cnt, "%s%%%llu", e->symbol_name, pct);
 	if (e->sym_name_malloced)
 		free(e->symbol_name);
 	e->symbol_name = name;
@@ -501,6 +525,7 @@ int resolve_overlaps(unsigned long long start_time)
 	int cnt = 0;
 
 	invalidate_earlybirds(start_time);
+	invalidate_zero_size_entries();
 	while ((rc = scan_overlaps()) && rc != OP_JIT_CONV_FAIL) {
 		resort_address();
 		if (cnt == 0) {

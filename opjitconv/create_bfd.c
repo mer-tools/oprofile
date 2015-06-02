@@ -15,10 +15,10 @@
  */
 
 #include "opjitconv.h"
-#include "opd_printf.h"
 #include "op_libiberty.h"
 
 #include <bfd.h>
+#include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
 
@@ -42,6 +42,9 @@ static int fill_symtab(void)
 	
 	syms = xmalloc(sizeof(asymbol *) * (entry_count+1));
 	syms[entry_count] = NULL;
+	assert(entries_address_ascending[0]->section);
+	// Do this to silence Coverity
+	section = entries_address_ascending[0]->section;
 	for (i = 0; i < entry_count; i++) {
 		e = entries_address_ascending[i];
 		if (e->section)
@@ -83,10 +86,7 @@ asection * create_section(bfd * abfd, char const * section_name,
 		bfd_perror("bfd_make_section");
 		goto error;
 	}
-	if (bfd_set_section_vma(abfd, section, vma) == FALSE) {
-		bfd_perror("bfd_set_section_vma");
-		goto error;
-	}
+	bfd_set_section_vma(abfd, section, vma);
 	if (bfd_set_section_size(abfd, section, size) == FALSE) {
 		bfd_perror("bfd_set_section_size");
 		goto error;
@@ -261,7 +261,7 @@ bfd * open_elf(char const * filename)
 		goto error;
 	}
 	if (bfd_set_arch_mach(abfd, dump_bfd_arch, dump_bfd_mach) == FALSE) {
-		bfd_perror("bfd_set_format");
+		bfd_perror("bfd_set_arch_mach");
 		goto error;
 	}
 	return abfd;

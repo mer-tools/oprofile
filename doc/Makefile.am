@@ -10,20 +10,21 @@ STYLESHEETS=$(CHUNK_XHTML_STYLESHEET) $(srcdir)/xsl/xhtml-common.xsl
 
 man_MANS = \
 	oprofile.1 \
-	opcontrol.1 \
 	opreport.1 \
 	opannotate.1 \
 	opgprof.1 \
 	ophelp.1 \
+	op-check-perfevents.1 \
 	oparchive.1 \
 	opimport.1
 
 if BUILD_FOR_PERF_EVENT
-man_MANS += operf.1
+man_MANS += operf.1 \
+			ocount.1
 endif
 
 htmldir = $(prefix)/share/doc/oprofile
-dist_html_DATA = oprofile.html internals.html opreport.xsd op-jit-devel.html
+dist_html_DATA = oprofile.html internals.html opreport.xsd ophelp.xsd op-jit-devel.html
 
 if have_xsltproc
 

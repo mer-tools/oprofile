@@ -27,6 +27,7 @@
 #include <cstring>
 #include <cassert>
 #include <iostream>
+#include <sstream>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -81,7 +82,9 @@ bool separate_debug_file_exists(string & name, unsigned long const crc,
 				      reinterpret_cast<unsigned char *>(&buffer[0]),
 				      file.gcount());
 	}
-	cverb << vbfd << " with crc32 = " << hex << file_crc << endl;
+	ostringstream message;
+	message << " with crc32 = " << hex << file_crc << endl;
+	cverb << vbfd << message.str();
 	return crc == file_crc;
 }
 
@@ -89,8 +92,8 @@ static bool find_debuginfo_file_by_buildid(unsigned char * buildid, string & deb
 {
 	size_t build_id_fname_size = strlen (DEBUGDIR) + (sizeof "/.build-id/" - 1) + 1
 			+ (2 * build_id_size) + (sizeof ".debug" - 1) + 1;
-	char * buildid_symlink = (char *) xmalloc(build_id_fname_size);
-	char * sptr = buildid_symlink;
+	char * build_id_fname = (char *) xmalloc(build_id_fname_size);
+	char * sptr = build_id_fname;
 	unsigned char * bptr = buildid;
 	bool retval = false;
 	size_t build_id_segment_len = strlen("/.build-id/");
@@ -107,14 +110,12 @@ static bool find_debuginfo_file_by_buildid(unsigned char * buildid, string & deb
 
 	strcpy(sptr, ".debug");
 
-	if (access (buildid_symlink, F_OK) == 0) {
-		debug_filename = op_realpath (buildid_symlink);
-		if (debug_filename.compare(buildid_symlink)) {
-			retval = true;
-			cverb << vbfd << "Using build-id symlink" << endl;
-		}
+	if (access(build_id_fname, R_OK) == 0) {
+		debug_filename = string(build_id_fname);
+		retval = true;
+		cverb << vbfd << "Using build-id file" << endl;
 	}
-	free(buildid_symlink);
+	free(build_id_fname);
 	if (!retval)
 		cverb << vbfd << "build-id file not found; falling back to CRC method." << endl;
 
@@ -434,8 +435,10 @@ bool find_separate_debug_file(bfd * ibfd, string const & filepath_in,
 	string second_try(DEBUGDIR + filedir + basename);
 	string third_try(filedir + basename);
 
-	cverb << vbfd << "looking for debugging file " << basename 
-	      << " with crc32 = " << hex << crc32 << endl;
+	ostringstream message;
+	message << "looking for debugging file " << basename
+	        << " with crc32 = " << hex << crc32 << endl;
+	cverb << vbfd << message.str();
 
 	if (separate_debug_file_exists(first_try, crc32, extra)) 
 		debug_filename = first_try; 
@@ -470,7 +473,8 @@ bool interesting_symbol(asymbol * sym)
 	/* ARM assembler internal mapping symbols aren't interesting */
 	if ((strcmp("$a", sym->name) == 0) ||
 	    (strcmp("$t", sym->name) == 0) ||
-	    (strcmp("$d", sym->name) == 0))
+	    (strcmp("$d", sym->name) == 0) ||
+	    (strcmp("$x", sym->name) == 0))
 		return false;
 
 	// C++ exception stuff
@@ -628,10 +632,14 @@ void bfd_info::translate_debuginfo_syms(asymbol ** dbg_syms, long nr_dbg_syms)
 
 bool bfd_info::get_synth_symbols()
 {
-	extern const bfd_target bfd_elf64_powerpc_vec;
-	extern const bfd_target bfd_elf64_powerpcle_vec;
-	bool is_elf64_powerpc_target = (abfd->xvec == &bfd_elf64_powerpc_vec)
-		|| (abfd->xvec == &bfd_elf64_powerpcle_vec);
+	const char* targname = bfd_get_target(abfd);
+	// Match elf64-powerpc and elf64-powerpc-freebsd, but not
+	// elf64-powerpcle.  elf64-powerpcle is a different ABI without
+	// function descriptors, so we don't need the synthetic
+	// symbols to have function code marked by a symbol.
+	bool is_elf64_powerpc_target = (!strncmp(targname, "elf64-powerpc", 13)
+					&& (targname[13] == 0
+					    || targname[13] == '-'));
 
 	if (!is_elf64_powerpc_target)
 		return false;
@@ -730,8 +738,10 @@ void bfd_info::get_symbols()
 	if (bfd_get_file_flags(abfd) & HAS_SYMS)
 		nr_syms = bfd_get_symtab_upper_bound(abfd);
 
-	cverb << vbfd << "bfd_get_symtab_upper_bound: " << dec
-	      << nr_syms << hex << endl;
+	ostringstream message;
+	message << "bfd_get_symtab_upper_bound: " << dec
+	        << nr_syms << hex << endl;
+	cverb << vbfd << message.str();
 
 	nr_syms /= sizeof(asymbol *);
 
@@ -743,8 +753,10 @@ void bfd_info::get_symbols()
 	} else {
 		syms.reset(new asymbol *[nr_syms]);
 		nr_syms = bfd_canonicalize_symtab(abfd, syms.get());
-		cverb << vbfd << "bfd_canonicalize_symtab: " << dec
-		      << nr_syms << hex << endl;
+		ostringstream message;
+		message << "bfd_canonicalize_symtab: " << dec
+		        << nr_syms << hex << endl;
+		cverb << vbfd << message.str();
 	}
 }
 

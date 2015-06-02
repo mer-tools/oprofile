@@ -98,6 +98,7 @@ formatter::formatter(extra_images const & extra)
 	vma_64(false),
 	long_filenames(false),
 	need_header(true),
+	global_percent(false),
 	extra_found_images(extra)
 {
 	format_map[ff_vma] = field_description(9, "vma", &formatter::format_vma);
@@ -511,6 +512,9 @@ void cg_formatter::output(ostream & out, symbol_collection const & syms)
 
 	for (it = syms.begin(); it < end; ++it) {
 		cg_symbol const * sym = dynamic_cast<cg_symbol const *>(*it);
+		// To silence coverity (since dynamic cast can theoretically return NULL)
+		if (!sym)
+			continue;
 
 		cg_symbol::children::const_iterator cit;
 		cg_symbol::children::const_iterator cend = sym->callers.end();
@@ -610,6 +614,7 @@ xml_formatter(profile_container const * p,
 	profile(p),
 	symbols(s),
 	need_details(false),
+	detail_count(0),
 	symbol_filter(sf)
 {
 	if (profile)
@@ -660,26 +665,12 @@ xml_formatter::get_bfd_object(symbol_entry const * symb, op_bfd * & abfd) const
 	bool ok = true;
 
 	string const & image_name = get_image_name(symb->image_name,
-		image_name_storage::int_filename, extra_found_images);
-	if (symb->spu_offset) {
-		// FIXME: what about archive:tmp, actually it's not supported
-		// for spu since oparchive doesn't archive the real file but
-		// in future it would work ?
-		string tmp = get_image_name(symb->embedding_filename, 
-			image_name_storage::int_filename, extra_found_images);
-		if (abfd && abfd->get_filename() == tmp)
-			return true;
-		delete abfd;
-		abfd = new op_bfd(symb->spu_offset, tmp,
-				  symbol_filter, extra_found_images, ok);
-	} else {
-		if (abfd && abfd->get_filename() == image_name)
-			return true;
-		delete abfd;
-		abfd = new op_bfd(image_name, symbol_filter,
-				  extra_found_images, ok);
-
-	}
+	                                           image_name_storage::int_filename, extra_found_images);
+	if (abfd && abfd->get_filename() == image_name)
+		return true;
+	delete abfd;
+	abfd = new op_bfd(image_name, symbol_filter,
+	                  extra_found_images, ok);
 
 	if (!ok) {
 		report_image_error(image_name, image_format_failure,

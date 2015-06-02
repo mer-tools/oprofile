@@ -13,12 +13,21 @@ oparchive \- produce archive of oprofile data for offline analysis
 [directory]
 .SH DESCRIPTION
 
+The
 .B oparchive
-generates a directory populated with executable, debug, and oprofile sample
-files. This directory can be move to another machine via tar and analyzed
-without further use of the data collection machine. See oprofile(1) for how
-to write profile specifications.
-
+utility is commonly used for collecting profile data on a "target"
+system for future offline analysis on a different ("host") machine.
+.B oparchive
+creates a directory populated with executables, libraries, debuginfo files, and oprofile sample
+files. This directory can be tar'ed up and moved to another machine to be analyzed
+without further use of the target machine. Using
+.BI opreport
+and other post-profiling tools against archived data requires the use of the
+.I archive:<archived-dir>
+specification. See oprofile(1) for how to write profile specifications.
+A complete description of offline analysis can be found in the chapter titled
+.I Analyzing profile data on another system (oparchive)
+of the OProfile user manual. (See the user manual URL in the "SEE ALSO" section below.)
 .SH OPTIONS
 .TP
 .BI "--help / -? / --usage"
@@ -36,12 +45,11 @@ Give verbose debugging output.
 .BI "--session-dir="dir_path
 Use sample database from the specified directory
 .I dir_path
-instead of the default locations. If
+instead of the default location. If
 .I --session-dir
 is not specified, then
 .B oparchive
-will search for samples in
-.I <current_dir>/oprofile_data
+will search for samples in <current_dir>/oprofile_data
 first. If that directory does not exist, the standard session-dir of /var/lib/oprofile is used.
 .br
 .TP
@@ -68,23 +76,20 @@ used --separate.
 Only list the files that would be archived, don't copy them.
 
 .SH ENVIRONMENT
-No special environment variables are recognised by oparchive.
+No special environment variables are recognized by oparchive.
 
 .SH FILES
-.I <current_dir>/oprofile_data/samples
-.RS 7
-Or
-.RE
-.I /var/lib/oprofile/samples/
-.LP
-.RS 7
+.TP
+.I <session_dir>/samples
 The location of the generated sample files.
-.RE
 
 .SH VERSION
 .TP
 This man page is current for @PACKAGE@-@VERSION@.
 
 .SH SEE ALSO
-.BR @OP_DOCDIR@,
+.BR file://@OP_DOCDIR@oprofile.html#oparchive
+.br
+.BR opimport(1)
+.br
 .BR oprofile(1)

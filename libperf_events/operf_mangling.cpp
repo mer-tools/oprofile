@@ -25,6 +25,7 @@
 #include "op_events.h"
 #include "op_libiberty.h"
 #include "cverb.h"
+#include "utility.h"
 
 #include <limits.h>
 #include <stdio.h>
@@ -108,8 +109,7 @@ mangle_filename(struct operf_sfile * last, struct operf_sfile const * sf, int co
 
 static void fill_header(struct opd_header * header, unsigned long counter,
                         vma_t anon_start, vma_t cg_to_anon_start,
-                        int is_kernel, int cg_to_is_kernel,
-                        int spu_samples, uint64_t embed_offset, time_t mtime)
+                        int is_kernel, int cg_to_is_kernel, time_t mtime)
 {
 	const operf_event_t * event = operfRead.get_event_by_counter(counter);
 
@@ -125,8 +125,6 @@ static void fill_header(struct opd_header * header, unsigned long counter,
 	header->cpu_speed = cpu_speed;
 	header->mtime = mtime;
 	header->anon_start = anon_start;
-	header->spu_profile = spu_samples;
-	header->embedded_offset = embed_offset;
 	header->cg_to_anon_start = cg_to_anon_start;
 }
 
@@ -137,6 +135,7 @@ int operf_open_sample_file(odb_t *file, struct operf_sfile *last,
 	char const * binary;
 	vma_t last_start = 0;
 	int err;
+	time_t mtime;
 
 	mangled = mangle_filename(last, sf, counter, cg);
 
@@ -145,7 +144,11 @@ int operf_open_sample_file(odb_t *file, struct operf_sfile *last,
 
 	cverb << vsfile << "Opening \"" << mangled << "\"" << endl;
 
-	create_path(mangled);
+	err = create_path(mangled);
+	if (err) {
+		cerr << "operf: create path for " << mangled << " failed: " << strerror(err) << endl;
+		goto out;
+	}
 
 	/* locking sf will lock associated cg files too */
 	operf_sfile_get(sf);
@@ -173,19 +176,32 @@ retry:
 		goto out;
 	}
 
-	if (!sf->kernel)
+	if (!sf->kernel) {
 		binary = sf->image_name;
-	else
+		mtime = op_get_mtime(binary);
+	} else {
 		binary = sf->kernel->name;
+
+		if (binary) {
+			if (strncmp(KALL_SYM_FILE, binary,
+				    strlen(KALL_SYM_FILE)) == 0 )
+			  /* The Kallsyms file is not a real file.  op_get_mtime() may
+			   * return different values for each call.
+			   */
+				mtime = 0;
+			else
+				mtime = op_get_mtime(binary);
+		} else {
+			mtime = 0;
+		}
+	}
 
 	if (last && last->is_anon)
 		last_start = last->start_addr;
 
 	fill_header((struct opd_header *)odb_get_data(file), counter,
 		    sf->is_anon ? sf->start_addr : 0, last_start,
-		    !!sf->kernel, last ? !!last->kernel : 0,
-		    0, 0,
-		    binary ? op_get_mtime(binary) : 0);
+		    !!sf->kernel, last ? !!last->kernel : 0, mtime);
 
 out:
 	operf_sfile_put(sf);

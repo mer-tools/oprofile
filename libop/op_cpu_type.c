@@ -11,14 +11,27 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <string.h>
 #include <sys/utsname.h>
 #include <ctype.h>
 #include <errno.h>
 #include <fnmatch.h>
+#include <elf.h>
+#include <link.h>
 
+#include "config.h"
 #include "op_cpu_type.h"
 #include "op_hw_specific.h"
+
+/* A macro to be used for ppc64 architecture-specific code.  The '__powerpc__' macro
+ * is defined for both ppc64 and ppc32 architectures, so we must further qualify by
+ * including the 'HAVE_LIBPFM' macro, since that macro will be defined only for ppc64.
+ */
+#define PPC64_ARCH (HAVE_LIBPFM) && ((defined(__powerpc__) || defined(__powerpc64__)))
 
 struct cpu_descr {
 	char const * pretty;
@@ -32,18 +45,10 @@ static struct cpu_descr const cpu_descrs[MAX_CPU_TYPE] = {
 	{ "PII", "i386/pii", CPU_PII, 2 },
 	{ "PIII", "i386/piii", CPU_PIII, 2 },
 	{ "Athlon", "i386/athlon", CPU_ATHLON, 4 },
-	{ "CPU with timer interrupt", "timer", CPU_TIMER_INT, 1 },
-	{ "CPU with RTC device", "rtc", CPU_RTC, 1 },
+        { "CPU with timer interrupt", "timer", CPU_TIMER_INT, 1 },
 	{ "P4 / Xeon", "i386/p4", CPU_P4, 8 },
-	{ "IA64", "ia64/ia64", CPU_IA64, 4 },
-	{ "Itanium", "ia64/itanium", CPU_IA64_1, 4 },
-	{ "Itanium 2", "ia64/itanium2", CPU_IA64_2, 4 },
 	{ "AMD64 processors", "x86-64/hammer", CPU_HAMMER, 4 },
 	{ "P4 / Xeon with 2 hyper-threads", "i386/p4-ht", CPU_P4_HT2, 4 },
-	{ "Alpha EV4", "alpha/ev4", CPU_AXP_EV4, 2 },
-	{ "Alpha EV5", "alpha/ev5", CPU_AXP_EV5, 3 },
-	{ "Alpha PCA56", "alpha/pca56", CPU_AXP_PCA56, 3 },
-	{ "Alpha EV6", "alpha/ev6", CPU_AXP_EV6, 2 },
 	{ "Alpha EV67", "alpha/ev67", CPU_AXP_EV67, 20 },
 	{ "Pentium M (P6 core)", "i386/p6_mobile", CPU_P6_MOBILE, 2 },
 	{ "ARM/XScale PMU1", "arm/xscale1", CPU_ARM_XSCALE1, 3 },
@@ -71,19 +76,15 @@ static struct cpu_descr const cpu_descrs[MAX_CPU_TYPE] = {
 	{ "Core 2", "i386/core_2", CPU_CORE_2, 2 },
 	{ "ppc64 POWER6", "ppc64/power6", CPU_PPC64_POWER6, 4 },
 	{ "ppc64 970MP", "ppc64/970MP", CPU_PPC64_970MP, 8 },
-	{ "ppc64 Cell Broadband Engine", "ppc64/cell-be", CPU_PPC64_CELL, 8 },
 	{ "AMD64 family10", "x86-64/family10", CPU_FAMILY10, 4 },
-	{ "ppc64 PA6T", "ppc64/pa6t", CPU_PPC64_PA6T, 6 },
 	{ "ARM 11MPCore", "arm/mpcore", CPU_ARM_MPCORE, 2 },
 	{ "ARM V6 PMU", "arm/armv6", CPU_ARM_V6, 3 },
 	{ "ppc64 POWER5++", "ppc64/power5++", CPU_PPC64_POWER5pp, 6 },
 	{ "e300", "ppc/e300", CPU_PPC_E300, 4 },
-	{ "AVR32", "avr32", CPU_AVR32, 3 },
 	{ "ARM Cortex-A8", "arm/armv7", CPU_ARM_V7, 5 },
  	{ "Intel Architectural Perfmon", "i386/arch_perfmon", CPU_ARCH_PERFMON, 0},
 	{ "AMD64 family11h", "x86-64/family11h", CPU_FAMILY11H, 4 },
 	{ "ppc64 POWER7", "ppc64/power7", CPU_PPC64_POWER7, 6 },
-	{ "ppc64 compat version 1", "ppc64/ibm-compat-v1", CPU_PPC64_IBM_COMPAT_V1, 4 },
    	{ "Intel Core/i7", "i386/core_i7", CPU_CORE_I7, 4 },
    	{ "Intel Atom", "i386/atom", CPU_ATOM, 2 },
 	{ "Loongson2", "mips/loongson2", CPU_MIPS_LOONGSON2, 2 },
@@ -109,6 +110,17 @@ static struct cpu_descr const cpu_descrs[MAX_CPU_TYPE] = {
 	{ "ARM Cortex-A15", "arm/armv7-ca15", CPU_ARM_V7_CA15, 7 },
 	{ "Intel Haswell microarchitecture", "i386/haswell", CPU_HASWELL, 4 },
 	{ "IBM zEnterprise EC12", "s390/zEC12", CPU_S390_ZEC12, 1 },
+	{ "AMD64 generic", "x86-64/generic", CPU_AMD64_GENERIC, 4 },
+	{ "IBM Power Architected Events V1", "ppc64/architected_events_v1", CPU_PPC64_ARCH_V1, 6 },
+	{ "ppc64 POWER8", "ppc64/power8", CPU_PPC64_POWER8, 6 },
+	{ "e500mc", "ppc/e500mc", CPU_PPC_E500MC, 4 },
+	{ "e6500", "ppc/e6500", CPU_PPC_E6500, 6 },
+	{ "Intel Silvermont microarchitecture", "i386/silvermont", CPU_SILVERMONT, 2 },
+	{ "ARMv7 Krait", "arm/armv7-krait", CPU_ARM_KRAIT, 5 },
+	{ "APM X-Gene", "arm/armv8-xgene", CPU_ARM_V8_APM_XGENE, 6 },
+	{ "Intel Broadwell microarchitecture", "i386/broadwell", CPU_BROADWELL, 4 },
+	{ "ARM Cortex-A57", "arm/armv8-ca57", CPU_ARM_V8_CA57, 6},
+	{ "ARM Cortex-A53", "arm/armv8-ca53", CPU_ARM_V8_CA53, 6},
 };
  
 static size_t const nr_cpu_descrs = sizeof(cpu_descrs) / sizeof(struct cpu_descr);
@@ -167,11 +179,139 @@ static char * _get_cpuinfo_cpu_type(char * buf, int len, const char * prefix)
 	return _get_cpuinfo_cpu_type_line(buf, len, prefix, 1);
 }
 
+#if PPC64_ARCH
+// The aux vector stuff below is currently only used by ppc64 arch
+static ElfW(auxv_t) * auxv_buf = NULL;
+
+static ElfW(auxv_t) * _auxv_fetch()
+{
+	ElfW(auxv_t) * auxv_temp = (ElfW(auxv_t) *)auxv_buf;
+	int auxv_f;
+	size_t page_size = getpagesize();
+	ssize_t bytes;
+
+
+	if(auxv_temp == NULL) {
+		auxv_f = open("/proc/self/auxv", O_RDONLY);
+
+		if(auxv_f == -1) {
+			perror("Cannot open /proc/self/auxv");
+			fprintf(stderr, "Assuming native platform profiling is supported.\n");
+			return NULL;
+		}
+		else {
+			auxv_temp = (ElfW(auxv_t) *)malloc(page_size);
+			if (!auxv_temp) {
+				perror("Allocation of space for auxv failed.");
+				close(auxv_f);
+				return NULL;
+			}
+			bytes = read(auxv_f, (void *)auxv_temp, page_size);
+
+			if (bytes <= 0) {
+				free(auxv_temp);
+				close(auxv_f);
+				perror("Error /proc/self/auxv read failed");
+				return NULL;
+			}
+
+			if (close(auxv_f)) {
+				perror("Error close failed");
+				fprintf(stderr, "Recoverable error. Continuing.\n");
+			}
+		}
+		auxv_buf = auxv_temp;
+	}
+	return (ElfW(auxv_t) *)auxv_temp;
+}
+
+
+static const char * fetch_at_hw_platform(ElfW(Addr) type)
+{
+	int i = 0;
+	const char * platform = NULL;
+	ElfW(auxv_t) * my_auxv = NULL;
+
+	if ((my_auxv = (ElfW(auxv_t)*) _auxv_fetch()) == NULL)
+		return NULL;
+
+	do {
+		if(my_auxv[i].a_type == type) {
+			platform = (const char *)my_auxv[i].a_un.a_val;
+			break;
+		}
+		i++;
+	} while (my_auxv[i].a_type != AT_NULL);
+
+	return platform;
+}
+
+static void release_at_hw_platform(void)
+{
+	if (auxv_buf) {
+		free(auxv_buf);
+		auxv_buf = NULL;
+	}
+}
+
+static op_cpu _try_ppc64_arch_generic_cpu(void)
+{
+	const char * platform, * base_platform;
+	op_cpu cpu_type = CPU_NO_GOOD;
+
+	platform = fetch_at_hw_platform(AT_PLATFORM);
+	base_platform = fetch_at_hw_platform(AT_BASE_PLATFORM);
+	if (!platform || !base_platform) {
+		fprintf(stderr, "NULL returned for one or both of AT_PLATFORM/AT_BASE_PLATFORM\n");
+		fprintf(stderr, "AT_PLATFORM: %s; \tAT_BASE_PLATFORM: %s\n", platform, base_platform);
+		release_at_hw_platform();
+		return cpu_type;
+	}
+	// FIXME whenever a new IBM Power processor is added -- need to ensure
+	// we're returning the correct version of the architected events file.
+	if (strcmp(platform, base_platform)) {
+		// If platform and base_platform differ by only a "+" at the end of the name, we
+		// consider these equal.
+		int platforms_are_equivalent = 0;
+		size_t p1_len, p2_len;
+		p1_len = strlen(platform);
+		p2_len = strlen(base_platform);
+		if (p2_len == (p1_len + 1)) {
+			if ((strncmp(platform, base_platform, p1_len) == 0) &&
+					(base_platform[p2_len - 1] == '+')) {
+				platforms_are_equivalent = 1;
+			}
+		}
+		if (!platforms_are_equivalent) {
+			//  FIXME
+			/* For POWER8 running in POWER7 compat mode (RHEL 6.5 and SLES 11 SP4),
+			 * the kernel will have enough POWER8-specific PMU code so we can utilize
+			 * all of the POWER8 events. In general, this is not necessarily the case
+			 * when running in compat mode.  This code needs to be inspected for every
+			 * new IBM Power processor released, but for now, we'll assume that for the
+			 * next processor model (assuming there will be something like a POWER9?),
+			 * we should use just the architected events when running POWER8 compat mode.
+			 */
+			if ((strcmp(platform, "power7") == 0) && (strcmp(base_platform, "power8") == 0))
+				cpu_type = CPU_PPC64_POWER8;
+			else
+				cpu_type = CPU_PPC64_ARCH_V1;
+		}
+	}
+	release_at_hw_platform();
+	return cpu_type;
+}
+
 static op_cpu _get_ppc64_cpu_type(void)
 {
 	int i;
 	size_t len;
 	char line[100], cpu_type_str[64], cpu_name_lowercase[64], * cpu_name;
+	op_cpu cpu_type = CPU_NO_GOOD;
+
+	cpu_type = _try_ppc64_arch_generic_cpu();
+	if (cpu_type != CPU_NO_GOOD)
+		return cpu_type;
 
 	cpu_name = _get_cpuinfo_cpu_type(line, 100, "cpu");
 	if (!cpu_name)
@@ -181,11 +321,48 @@ static op_cpu _get_ppc64_cpu_type(void)
 	for (i = 0; i < (int)len ; i++)
 		cpu_name_lowercase[i] = tolower(cpu_name[i]);
 
+	if (strncmp(cpu_name_lowercase, "power7+", 7) == 0)
+		cpu_name_lowercase[6] = '\0';
+	if (strncmp(cpu_name_lowercase, "power8e", 7) == 0)
+		cpu_name_lowercase[6] = '\0';
+
 	cpu_type_str[0] = '\0';
 	strcat(cpu_type_str, "ppc64/");
 	strncat(cpu_type_str, cpu_name_lowercase, len);
-	return op_get_cpu_number(cpu_type_str);
+	cpu_type = op_get_cpu_number(cpu_type_str);
+	return cpu_type;
 }
+#else
+static op_cpu _get_ppc64_cpu_type(void)
+{
+	return CPU_NO_GOOD;
+}
+#endif
+
+
+static char *alpha_cpu_models[] = {
+	"EV67", "EV68CB", "EV68AL", "EV68CX", "EV7", "EV79", "EV69", NULL
+};
+
+
+static op_cpu _get_alpha_cpu_type(void)
+{
+	char *cpu_model;
+	char **p;
+	char line[100];
+
+	cpu_model = _get_cpuinfo_cpu_type(line, 100, "cpu model");
+	if (!cpu_model)
+		return CPU_NO_GOOD;
+
+	for (p = alpha_cpu_models; *p; p++) {
+		if (strcmp(cpu_model, *p) == 0)
+			return CPU_AXP_EV67;
+	}
+
+	return CPU_NO_GOOD;
+}
+
 
 static op_cpu _get_arm_cpu_type(void)
 {
@@ -233,6 +410,20 @@ static op_cpu _get_arm_cpu_type(void)
 			return op_get_cpu_number("arm/armv7-ca9");
 		case 0xc0f:
 			return op_get_cpu_number("arm/armv7-ca15");
+		case 0xd07:
+			return op_get_cpu_number("arm/armv8-ca57");
+		case 0xd03:
+			return op_get_cpu_number("arm/armv8-ca53");
+		}
+	} else if (vendorid == 0x42) {  /* Broadcom Corporation */
+		switch (cpuid) {
+		case 0x00f:
+			return op_get_cpu_number("arm/armv7-ca15");
+		}
+	} else if (vendorid == 0x50) {	/* Applied Micro Circuits Corporation */
+		switch (cpuid) {
+		case 0x000:
+			return op_get_cpu_number("arm/armv8-xgene");
 		}
 	} else if (vendorid == 0x69) {	/* Intel xscale */
 		switch (cpuid >> 9) {
@@ -241,6 +432,11 @@ static op_cpu _get_arm_cpu_type(void)
 		case 2:
 			return op_get_cpu_number("arm/xscale2");
 		}
+    } else if (vendorid == 0x51) {  /* Qualcomm */
+        switch (cpuid) {
+        case 0x4d:
+            return op_get_cpu_number("arm/armv7-krait"); /* MSM8930 */
+        }
 	}
 
 	return CPU_NO_GOOD;
@@ -345,14 +541,21 @@ static op_cpu _get_intel_cpu_type(void)
 
 static op_cpu _get_amd_cpu_type(void)
 {
-	unsigned eax, family, model;
+	unsigned eax, family;
 	op_cpu ret = CPU_NO_GOOD;
+	char buf[20] = {'\0'};
 
 	eax = cpuid_signature();
 	family = cpu_family(eax);
-	model = cpu_model(eax);
+
+	/* These family does not exist in the past.*/
+	if ((family < 0x0f && family != 0x6) || family == 0x13)
+		return ret;
 
 	switch (family) {
+	case 0x6:
+		ret = op_get_cpu_number("i386/athlon");
+		break;
 	case 0x0f:
 		ret = op_get_cpu_number("x86-64/hammer");
 		break;
@@ -360,24 +563,17 @@ static op_cpu _get_amd_cpu_type(void)
 		ret = op_get_cpu_number("x86-64/family10");
 		break;
 	case 0x11:
-		ret = op_get_cpu_number("x86-64/family11h");
-		break;
 	case 0x12:
-		ret = op_get_cpu_number("x86-64/family12h");
-		break;
 	case 0x14:
-		ret = op_get_cpu_number("x86-64/family14h");
-		break;
 	case 0x15:
-		switch (model) {
-		case 0x00 ... 0x0f:
-			ret = op_get_cpu_number("x86-64/family15h");
-			break;		
-		default:
-			break;
-		}
+		/* From family11h and forward, we use the same naming scheme */
+		snprintf(buf, 20, "x86-64/family%xh", family);
+		ret = op_get_cpu_number(buf);
 		break;
 	default:
+		/* Future processors */
+		snprintf(buf, 20, "x86-64/generic");
+		ret = op_get_cpu_number(buf);
 		break;
 	}
 
@@ -458,7 +654,40 @@ static op_cpu _get_mips_cpu_type(void)
 	return CPU_NO_GOOD;
 }
 
-static op_cpu __get_cpu_type_alt_method(void)
+static op_cpu _get_s390_cpu_type(void)
+{
+	char line[100];
+	char *ptr;
+	const char prefix[] = "machine = ";
+	unsigned model;
+
+	ptr = _get_cpuinfo_cpu_type_line(line, sizeof(line), "processor", 0);
+	if (!ptr)
+		return CPU_NO_GOOD;
+
+	ptr = strstr(ptr, prefix);
+	if (!ptr)
+		return CPU_NO_GOOD;
+
+	ptr += sizeof(prefix) - 1;
+	if (sscanf(ptr, "%u", &model) != 1)
+		return CPU_NO_GOOD;
+
+	switch (model) {
+	case 2097:
+	case 2098:
+		return CPU_S390_Z10;
+	case 2817:
+	case 2818:
+		return CPU_S390_Z196;
+	case 2827:
+	case 2828:
+		return CPU_S390_ZEC12;
+	}
+	return CPU_NO_GOOD;
+}
+
+static op_cpu __get_cpu_type(void)
 {
 	struct utsname uname_info;
 	if (uname(&uname_info) < 0) {
@@ -469,10 +698,15 @@ static op_cpu __get_cpu_type_alt_method(void)
 	    fnmatch("i?86", uname_info.machine, 0) == 0) {
 		return _get_x86_64_cpu_type();
 	}
-	if (strncmp(uname_info.machine, "ppc64", 5) == 0) {
+	if ((strncmp(uname_info.machine, "ppc64", 5) == 0) ||
+			(strncmp(uname_info.machine, "ppc64le", 7) == 0)) {
 		return _get_ppc64_cpu_type();
 	}
-	if (strncmp(uname_info.machine, "arm", 3) == 0) {
+	if (strncmp(uname_info.machine, "alpha", 5) == 0) {
+		return _get_alpha_cpu_type();
+	}
+	if (strncmp(uname_info.machine, "arm", 3) == 0 ||
+	    strncmp(uname_info.machine, "aarch64", 7) == 0) {
 		return _get_arm_cpu_type();
 	}
 	if (strncmp(uname_info.machine, "tile", 4) == 0) {
@@ -480,6 +714,9 @@ static op_cpu __get_cpu_type_alt_method(void)
 	}
 	if (strncmp(uname_info.machine, "mips", 4) == 0) {
 		return _get_mips_cpu_type();
+	}
+	if (strncmp(uname_info.machine, "s390", 4) == 0) {
+		return _get_s390_cpu_type();
 	}
 	return CPU_NO_GOOD;
 }
@@ -504,6 +741,8 @@ op_cpu op_cpu_base_type(op_cpu cpu_type)
 	case CPU_ATOM:
 	case CPU_NEHALEM:
 	case CPU_HASWELL:
+	case CPU_BROADWELL:
+	case CPU_SILVERMONT:
 	case CPU_WESTMERE:
 	case CPU_SANDYBRIDGE:
 	case CPU_IVYBRIDGE:
@@ -517,35 +756,13 @@ op_cpu op_cpu_base_type(op_cpu cpu_type)
 op_cpu op_get_cpu_type(void)
 {
 	int cpu_type = CPU_NO_GOOD;
-	char str[100];
-	FILE * fp;
 
-	fp = fopen("/proc/sys/dev/oprofile/cpu_type", "r");
-	if (!fp) {
-		/* Try 2.6's oprofilefs one instead. */
-		fp = fopen("/dev/oprofile/cpu_type", "r");
-		if (!fp) {
-			if ((cpu_type = __get_cpu_type_alt_method()) == CPU_NO_GOOD) {
-				fprintf(stderr, "Unable to open cpu_type file for reading\n");
-				fprintf(stderr, "Make sure you have done opcontrol --init\n");
-			}
-			return cpu_type;
-		}
+	if ((cpu_type = __get_cpu_type()) == CPU_NO_GOOD) {
+		fprintf(stderr, "Unable to obtain cpu_type\n");
+		fprintf(stderr, "Verify that a pre-1.0 version of OProfile is not in use.\n"
+		        "If the /dev/oprofile/cpu_type file exists, locate the pre-1.0 OProfile\n"
+		        "installation, and use its 'opcontrol' command, passing the --deinit option.\n");
 	}
-
-	if (!fgets(str, 99, fp)) {
-		fprintf(stderr, "Could not read cpu type.\n");
-		fclose(fp);
-		return cpu_type;
-	}
-
-	cpu_type = op_get_cpu_number(str);
-
-	if (op_cpu_variations(cpu_type))
-		cpu_type = op_cpu_specific_type(cpu_type);
-
-	fclose(fp);
-
 	return cpu_type;
 }
 
@@ -553,6 +770,7 @@ op_cpu op_get_cpu_type(void)
 op_cpu op_get_cpu_number(char const * cpu_string)
 {
 	int cpu_type = CPU_NO_GOOD;
+	int scan_matches = 0;
 	size_t i;
 	
 	for (i = 0; i < nr_cpu_descrs; ++i) {
@@ -563,12 +781,11 @@ op_cpu op_get_cpu_number(char const * cpu_string)
 	}
 
 	/* Attempt to convert into a number */
-	if (cpu_type == CPU_NO_GOOD)
-		sscanf(cpu_string, "%d\n", &cpu_type);
-	
-	if (cpu_type <= CPU_NO_GOOD || cpu_type >= MAX_CPU_TYPE)
-		cpu_type = CPU_NO_GOOD;
-
+	if (cpu_type == CPU_NO_GOOD) {
+		scan_matches = sscanf(cpu_string, "%d\n", &cpu_type);
+		if (scan_matches && (cpu_type <= CPU_NO_GOOD || cpu_type >= MAX_CPU_TYPE))
+			cpu_type = CPU_NO_GOOD;
+	}
 	return cpu_type;
 }
 
@@ -599,26 +816,8 @@ int op_get_nr_counters(op_cpu cpu_type)
 		return 0;
 
 	cnt = arch_num_counters(cpu_type);
-	if (cnt >= 0)
-		return cnt;
-
-	return op_cpu_has_timer_fs()
-		? cpu_descrs[cpu_type].nr_counters + 1
-		: cpu_descrs[cpu_type].nr_counters;
+	if (cnt < 0)
+		cnt = cpu_descrs[cpu_type].nr_counters;
+	return cnt;
 }
 
-int op_cpu_has_timer_fs(void)
-{
-	static int cached_has_timer_fs_p = -1;
-	FILE * fp;
-
-	if (cached_has_timer_fs_p != -1)
-		return cached_has_timer_fs_p;
-
-	fp = fopen("/dev/oprofile/timer", "r");
-	cached_has_timer_fs_p = !!fp;
-	if (fp)
-		fclose(fp);
-
-	return cached_has_timer_fs_p;
-}

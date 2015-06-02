@@ -31,6 +31,21 @@ char op_device[PATH_MAX];
 char op_note_device[PATH_MAX];
 char op_hash_device[PATH_MAX];
 
+char * stats_filenames[OPERF_MAX_STATS] = {
+                                           "total_samples",
+                                           "",
+                                           "",
+                                           "lost_invalid_domain",
+                                           "lost_kernel",
+                                           "lost_samplefile",
+                                           "lost_no_mapping",
+                                           "lost_no_app_for_kernel_sample",
+                                           "lost_no_app_for_user_sample",
+                                           "lost_bt_no_mapping",
+                                           "lost_invalid_hypervisor_addr",
+                                           "lost_records_by_kernel",
+};
+
 void
 init_op_config_dirs(char const * session_dir)
 {
@@ -53,15 +68,4 @@ init_op_config_dirs(char const * session_dir)
 	strcpy(op_samples_current_dir, op_samples_dir);
 	strcat(op_samples_current_dir, "/current/");
 
-	strcpy(op_lock_file, op_session_dir);
-	strcat(op_lock_file, "/lock");
-
-	strcpy(op_pipe_file, op_session_dir);
-	strcat(op_pipe_file, "/opd_pipe");
-
-	strcpy(op_log_file, op_samples_dir);
-	strcat(op_log_file, "oprofiled.log");
-
-	strcpy(op_dump_status, op_session_dir);
-	strcat(op_dump_status, "/complete_dump");
 }

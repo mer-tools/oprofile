@@ -17,6 +17,7 @@
 #include <cstring>
 
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <cstdlib>
 
@@ -24,6 +25,8 @@
 #include <iostream>
 #include <iomanip>
 #include <sstream>
+#include <cstdio>
+#include <fstream>
 
 #include "op_bfd.h"
 #include "locate_images.h"
@@ -81,7 +84,7 @@ op_bfd_symbol::op_bfd_symbol(bfd_vma vma, size_t size, string const & name)
 	: bfd_symbol(0), symb_value(vma),
 	  section_filepos(0), section_vma(0),
 	  symb_size(size), symb_name(name),
-	  symb_artificial(true)
+	  symb_hidden(false), symb_weak(false), symb_artificial(true)
 {
 }
 
@@ -104,13 +107,14 @@ op_bfd::op_bfd(string const & fname, string_filter const & symbol_filter,
 	archive_path(extra_images.get_archive_path()),
 	extra_found_images(extra_images),
 	file_size(-1),
-	anon_obj(false)
+	anon_obj(false),
+	vma_adj(0)
 {
-	int fd;
+	fd =  -1;
 	struct stat st;
 	// after creating all symbol it's convenient for user code to access
 	// symbols through a vector. We use an intermediate list to avoid a
-	// O(N²) behavior when we will filter vector element below
+	// O(Nï¿½) behavior when we will filter vector element below
 	symbols_found_t symbols;
 	asection const * sect;
 	string suf = ".jo";
@@ -143,7 +147,6 @@ op_bfd::op_bfd(string const & fname, string_filter const & symbol_filter,
 	file_size = st.st_size;
 
 	ibfd.abfd = fdopen_bfd(image_path, fd);
-
 	if (!ibfd.valid()) {
 		cverb << vbfd << "fdopen_bfd failed for " << image_path << endl;
 		ok = false;
@@ -189,6 +192,14 @@ out_fail:
 
 op_bfd::~op_bfd()
 {
+	if (ibfd.abfd == (bfd * ) 1)
+		/* Kallsyms setup a pseudo ibfd file.  Set to NULL
+		 * to prevent a segmentation fault.
+		 */
+		ibfd.abfd = (bfd * ) NULL;
+
+	if (fd != -1)
+		close(fd);
 }
 
 
@@ -220,7 +231,7 @@ void op_bfd::get_symbols(op_bfd::symbols_found_t & symbols)
 	if (dbfd.valid() && !ibfd.nr_syms)
 		vma_adj = ibfd.abfd->start_address - dbfd.abfd->start_address;
 	else
-	vma_adj= 0;
+		vma_adj= 0;
 
 	size_t i;
 	for (i = 0; i < ibfd.nr_syms; ++i) {
@@ -280,6 +291,118 @@ void op_bfd::get_symbols(op_bfd::symbols_found_t & symbols)
 	}
 }
 
+#define KERN_ADDR_SPACE_START_SYMBOL  "_text"
+#define KERN_ADDR_SPACE_END_SYMBOL    "_etext"
+
+void op_bfd::get_kallsym_symbols(symbols_found_t & symbols, ifstream& infile)
+{
+	string name, name_prev;
+	string address_str;
+	std::string line;
+	char type;
+	stringstream iss;
+
+	bfd_vma start = 0, start_prev = 0;
+	unsigned long long length, start_value;
+	bool ignore_symbol = true;
+	bfd_vma base_addr = 0;
+	name_prev = "";
+
+	while ( !infile.eof() ) {
+		getline(infile, line);
+
+		/* some of the lines have tab[nfs] on the end, remove */
+		iss.clear();
+		iss << line;
+
+		iss >> address_str;
+		iss >> type;
+		iss >> name;
+
+		sscanf(address_str.c_str(), "%llx", &start_value);
+		start = start_value;
+
+		if (start_prev == start)
+			length = 0;
+		else
+			length = start - start_prev;
+
+		if (!ignore_symbol)
+			symbols.push_back(op_bfd_symbol(op_bfd_symbol(start_prev - base_addr,
+							length, name_prev)));
+		start_prev = start;
+		name_prev = name;
+
+		if (strncmp(name.c_str(), KERN_ADDR_SPACE_START_SYMBOL,
+			    strlen(name.c_str())) == 0) {
+			/* ignore all symbols before the symbol for the
+			 * start of the kernel address space.
+			 */
+			if (start == 0)
+				/* do not have the proper permission to
+				 * read /proc/kallsyms.
+				 */
+				return;
+
+			base_addr = start;
+			ignore_symbol = false;
+		}
+
+		if (strncmp(name.c_str(), KERN_ADDR_SPACE_END_SYMBOL,
+			    strlen(name.c_str())) == 0)
+			break;
+	}
+
+	/* Add symbols */
+	copy(symbols.begin(), symbols.end(), back_inserter(syms));
+
+	ostringstream msg;
+	msg << "Kallsyms, number of symbols now "
+	    << dec << syms.size() << hex << endl;
+	cverb << vbfd << msg.str();
+	return;
+}
+
+/*
+ * This overload of the op_bfd constructor is patterned after the
+ * constructor in libutil++/op_bfd.cpp, with the additional processing
+ * needed to handle getting the kernel symbols from kallsyms.
+ */
+op_bfd::op_bfd(string const & fname, extra_images const & extra_images)
+	:
+	filename(fname),
+	archive_path(""),
+	extra_found_images(extra_images),
+	file_size(-1),
+	anon_obj(false),
+	vma_adj(0)
+
+{
+	symbols_found_t symbols;
+	ifstream infile;
+	fd =  -1;
+
+	ibfd.abfd = (bfd * ) NULL;
+
+	/* Technically this is not a bfd file but we need to set ibfd.abfd
+	 * so the abfd.valid() check in profile_t::set_offset() will be true.
+	 * It will be set to 1 so we know we are using kallsyms.  The
+	 * destructor will be looking for ibfd.abfd = 1.
+	 */
+	infile.open(fname.c_str());
+	if (infile) {
+		ibfd.abfd = (bfd * ) 1;
+	} else {
+		cverb << vbfd << "open failed for " << fname << endl;
+		return;
+	}
+
+	/* go read the kallsyms file and put them into symbols */
+	get_kallsym_symbols(symbols, infile);
+
+	infile.close();
+	return;
+}
 
 void op_bfd::add_symbols(op_bfd::symbols_found_t & symbols,
                          string_filter const & symbol_filter)
@@ -346,7 +469,7 @@ bool op_bfd::has_debug_info() const
 	if (debug_info.cached())
 		return debug_info.get();
 
-	if (!ibfd.valid())
+	if (ibfd.is_pseudo_bfd() || !ibfd.valid())
 		return debug_info.reset(false);
 
 	if (ibfd.has_debug_info())

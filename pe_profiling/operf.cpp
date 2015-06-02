@@ -11,7 +11,7 @@
  * (C) Copyright IBM Corp. 2011
  *
  * Modified by Maynard Johnson <maynardj@us.ibm.com>
- * (C) Copyright IBM Corporation 2012
+ * (C) Copyright IBM Corporation 2012, 2013, 2014
  *
  */
 
@@ -33,8 +33,10 @@
 #include <sys/wait.h>
 #include <ftw.h>
 #include <getopt.h>
+#include <time.h>
 #include <iostream>
 #include "operf_utils.h"
+#include "op_pe_utils.h"
 #include "op_libiberty.h"
 #include "string_manip.h"
 #include "cverb.h"
@@ -46,8 +48,12 @@
 #include "operf_kernel.h"
 #include "child_reader.h"
 #include "op_get_time.h"
+#include "operf_stats.h"
+#include "op_netburst.h"
+#include "utility.h"
 
 using namespace std;
+using namespace op_pe_utils;
 
 typedef enum END_CODE {
 	ALL_OK = 0,
@@ -59,23 +65,32 @@ typedef enum END_CODE {
 
 // Globals
 char * app_name = NULL;
+bool use_cpu_minus_one = false;
 pid_t app_PID = -1;
 uint64_t kernel_start, kernel_end;
-operf_read operfRead;
 op_cpu cpu_type;
 double cpu_speed;
-char op_samples_current_dir[PATH_MAX];
-uint op_nr_counters;
+uint op_nr_events;
 verbose vmisc("misc");
 uid_t my_uid;
 bool no_vmlinux;
 int kptr_restrict;
 char * start_time_human_readable;
+std::vector<operf_event_t> events;
+operf_read operfRead(events);
+/* With certain operf options, we have to take extra steps to track new threads
+ * and processes that an app may create via pthread_create, fork, etc.  Note that
+ * any such thread or process creation APIs will result in a PERF_RECORD_FORK event,
+ * so we handle these new threads/processes in operf_utils::__handle_fork_event.
+ */
+bool track_new_forks;
+
 
 #define DEFAULT_OPERF_OUTFILE "operf.data"
-#define CALLGRAPH_MIN_COUNT_SCALE 15
+#define KERN_ADDR_SPACE_START_SYMBOL  "_text"
+#define KERN_ADDR_SPACE_END_SYMBOL    "_etext"
 
-static char full_pathname[PATH_MAX];
+static operf_record * operfRecord = NULL;
 static char * app_name_SAVE = NULL;
 static char ** app_args = NULL;
 static 	pid_t jitconv_pid = -1;
@@ -86,11 +101,23 @@ static string samples_dir;
 static bool startApp;
 static string outputfile;
 static char start_time_str[32];
-static vector<operf_event_t> events;
 static bool jit_conversion_running;
 static void convert_sample_data(void);
 static int sample_data_pipe[2];
-static bool ctl_c = false;
+static int app_ready_pipe[2], start_app_pipe[2], operf_record_ready_pipe[2];
+// The operf_convert_record_write_pipe is used for the convert process to send
+// forked PID data to the record process.
+static int operf_convert_record_write_pipe[2];
+// The operf_record_convert_write_pipe is used for the record process to send
+// data to the convert process in response to the forked PID data.
+static int operf_record_convert_write_pipe[2];
+// The operf_post_profiling_pipe is used by the main process to inform the operf_read_pid
+// that profiling is done.  The operf_read_pid will then print its progress in
+// finishing the conversion.
+static int operf_post_profiling_pipe[2];
+
+bool ctl_c = false;
+bool pipe_closed = false;
 
 
 namespace operf_options {
@@ -104,7 +131,7 @@ string vmlinux;
 bool separate_cpu;
 bool separate_thread;
 bool post_conversion;
-vector<string> evts;
+set<string> evts;
 }
 
 static const char * valid_verbose_vals[] = { "debug", "record", "convert", "misc", "sfile", "arcs", "all"};
@@ -133,6 +160,17 @@ const char * short_options = "V:d:k:gsap:e:ctlhuv";
 
 vector<string> verbose_string;
 
+void __set_event_throttled(int index)
+{
+	if (index < 0) {
+		cerr << "Unable to determine if throttling occurred for ";
+		cerr << "event " << events[index].name << endl;
+	} else {
+		throttled = true;
+		events[index].throttled = true;
+	}
+}
+
 static void __print_usage_and_exit(const char * extra_msg)
 {
 	if (extra_msg)
@@ -142,7 +180,7 @@ static void __print_usage_and_exit(const char * extra_msg)
 	exit(EXIT_FAILURE);
 }
 
-
+// Signal handler for main (parent) process.
 static void op_sig_stop(int val __attribute__((unused)))
 {
 	// Received a signal to quit, so we need to stop the
@@ -155,9 +193,14 @@ static void op_sig_stop(int val __attribute__((unused)))
 		kill(app_PID, SIGKILL);
 }
 
+// For child processes to manage a controlled stop after Ctl-C is done
 static void _handle_sigint(int val __attribute__((unused)))
 {
 	size_t dummy __attribute__ ((__unused__));
+	/* Each process (parent and each forked child) will have their own copy of
+	 * the ctl_c variable, so this can be used by each process in managing their
+	 * shutdown procedure.
+	 */
 	ctl_c = true;
 	if (cverb << vdebug)
 		dummy = write(1, "in _handle_sigint\n", 19);
@@ -165,7 +208,7 @@ static void _handle_sigint(int val __attribute__((unused)))
 }
 
 
-void _set_signals_for_record(void)
+void _set_basic_SIGINT_handler_for_child(void)
 {
 	struct sigaction act;
 	sigset_t ss;
@@ -183,7 +226,7 @@ void _set_signals_for_record(void)
 	}
 }
 
-void set_signals(void)
+void set_signals_for_parent(void)
 {
 	struct sigaction act;
 	sigset_t ss;
@@ -202,8 +245,6 @@ void set_signals(void)
 	}
 }
 
-static int app_ready_pipe[2], start_app_pipe[2], operf_record_ready_pipe[2];
-
 static string args_to_string(void)
 {
 	string ret;
@@ -218,13 +259,8 @@ static string args_to_string(void)
 
 void run_app(void)
 {
+	// ASSUMPTION: app_name is a fully-qualified pathname
 	char * app_fname = rindex(app_name, '/') + 1;
-	if (!app_fname) {
-		string msg = "Error trying to parse app name ";
-		msg += app_name;
-		__print_usage_and_exit(msg.c_str());
-	}
-
 	app_args[0] = app_fname;
 
 	string arg_str = args_to_string();
@@ -292,14 +328,24 @@ int start_profiling(void)
 		perror("Internal error: could not create pipe");
 		return -1;
 	}
+	if (pipe2(operf_convert_record_write_pipe, O_NONBLOCK) < 0) {
+		perror("Internal error: could not create pipe");
+		return -1;
+	}
+	if (pipe(operf_record_convert_write_pipe) < 0) {
+		perror("Internal error: could not create pipe");
+		return -1;
+	}
 	operf_record_pid = fork();
 	if (operf_record_pid < 0) {
 		return -1;
 	} else if (operf_record_pid == 0) { // operf-record process
 		int ready = 0;
 		int exit_code = EXIT_SUCCESS;
-		_set_signals_for_record();
+		_set_basic_SIGINT_handler_for_child();
 		close(operf_record_ready_pipe[0]);
+		close(operf_convert_record_write_pipe[1]);
+		close(operf_record_convert_write_pipe[0]);
 		if (!operf_options::post_conversion)
 			close(sample_data_pipe[0]);
 		/*
@@ -325,11 +371,12 @@ int start_profiling(void)
 			} else {
 				outfd = sample_data_pipe[1];
 			}
-			operf_record operfRecord(outfd, operf_options::system_wide, app_PID,
+			operfRecord = new operf_record(outfd, operf_options::system_wide, app_PID,
 			                         (operf_options::pid == app_PID), events, vi,
 			                         operf_options::callgraph,
-			                         operf_options::separate_cpu, operf_options::post_conversion);
-			if (operfRecord.get_valid() == false) {
+			                         operf_options::separate_cpu, operf_options::post_conversion,
+			                         operf_convert_record_write_pipe[0], operf_record_convert_write_pipe[1]);
+			if (operfRecord->get_valid() == false) {
 				/* If valid is false, it means that one of the "known" errors has
 				 * occurred:
 				 *   - profiled process has already ended
@@ -352,10 +399,11 @@ int start_profiling(void)
 			}
 
 			// start recording
-			operfRecord.recordPerfData();
-			cverb << vmisc << "Total bytes recorded from perf events: " << dec
-					<< operfRecord.get_total_bytes_recorded() << endl;
-		} catch (runtime_error re) {
+			operfRecord->recordPerfData();
+			cverb << vdebug << "Total bytes recorded from perf events: " << dec
+					<< operfRecord->get_total_bytes_recorded() << endl;
+			delete operfRecord;
+		} catch (const runtime_error & re) {
 			/* If the user does ctl-c, the operf-record process may get interrupted
 			 * in a system call, causing problems with writes to the sample data pipe.
 			 * So we'll ignore such errors unless the user requests debug info.
@@ -370,6 +418,18 @@ int start_profiling(void)
 		_exit(exit_code);
 
 fail_out:
+		if (operfRecord)
+			try {
+				delete operfRecord;
+			} catch (const runtime_error & re) {
+				// We're already in failure mode here; if we get a runtime_error while
+				// deleting operfRecord, we'll only print it if user requests "-V misc"
+				if (cverb << vmisc) {
+					cerr << "Caught runtime_error: " << re.what() << endl;
+					exit_code = EXIT_FAILURE;
+				}
+			}
+
 		if (!ready){
 			/* ready==0 means we've not yet told parent we're ready,
 			 * but the parent is reading our pipe.  So we tell the
@@ -426,80 +486,46 @@ fail_out:
 	return 0;
 }
 
-static end_code_t _kill_operf_read_pid(end_code_t rc)
+static end_code_t _waitfor_operf_read_pid(end_code_t rc)
 {
-	// Now stop the operf-read process
-	int waitpid_status;
-	struct timeval tv;
-	long long start_time_sec;
-	long long usec_timer;
-	bool keep_trying = true;
-	waitpid_status = 0;
-	gettimeofday(&tv, NULL);
-	start_time_sec = tv.tv_sec;
-	usec_timer = tv.tv_usec;
-	/* We'll initially try the waitpid with WNOHANG once every 100,000 usecs.
-	 * If it hasn't ended within 5 seconds, we'll kill it and do one
-	 * final wait.
-	 */
-	while (keep_trying) {
-		int option = WNOHANG;
-		int wait_rc;
-		gettimeofday(&tv, NULL);
-		if (tv.tv_sec > start_time_sec + 5) {
-			keep_trying = false;
-			option = 0;
-			cerr << "now trying to kill convert pid..." << endl;
+	// Now wait for the operf-read process to finish
+	int wait_rc, waitpid_status, post_processing = 1;
 
-			if (kill(operf_read_pid, SIGUSR1) < 0) {
-				perror("Attempt to stop operf-read process failed");
-				rc = rc ? PERF_BOTH_ERROR : PERF_READ_ERROR;
-				break;
-			}
-		} else {
-			/* If we exceed the 100000 usec interval or if the tv_usec
-			 * value has rolled over to restart at 0, then we reset
-			 * the usec_timer to current tv_usec and try waitpid.
-			 */
-			if ((tv.tv_usec % 1000000) > (usec_timer + 100000)
-					|| (tv.tv_usec < usec_timer))
-				usec_timer = tv.tv_usec;
-			else
-				continue;
+	if (write(operf_post_profiling_pipe[1], &post_processing, sizeof(post_processing)) < 0) {
+		perror("Internal error:  Failed to write to operf_post_profiling_pipe");
+		rc = rc ? PERF_BOTH_ERROR : PERF_READ_ERROR;
+		return rc;
+	}
+	waitpid_status = 0;
+	if ((wait_rc = waitpid(operf_read_pid, &waitpid_status, 0)) < 0) {
+		if (errno != ECHILD) {
+			perror("waitpid for operf-read process failed");
+			rc = rc ? PERF_BOTH_ERROR : PERF_READ_ERROR;
 		}
-		if ((wait_rc = waitpid(operf_read_pid, &waitpid_status, option)) < 0) {
-			keep_trying = false;
-			if (errno != ECHILD) {
-				perror("waitpid for operf-read process failed");
-				rc = rc ? PERF_BOTH_ERROR : PERF_READ_ERROR;
-			}
-		} else if (wait_rc) {
-			if (WIFEXITED(waitpid_status)) {
-				keep_trying = false;
-				if (!WEXITSTATUS(waitpid_status)) {
-					cverb << vdebug << "operf-read process returned OK" << endl;
-				} else if (WIFEXITED(waitpid_status)) {
-					/* If user did ctl-c, operf-record may get spurious errors, like
-					 * broken pipe, etc.  We ignore these unless the user asks for
-					 * debug output.
-					 */
-					if (!ctl_c || cverb << vdebug) {
-						cerr <<  "operf-read process ended abnormally.  Status = "
-						     << WEXITSTATUS(waitpid_status) << endl;
-						rc = rc ? PERF_BOTH_ERROR : PERF_READ_ERROR;
-					}
-				}
-			}  else if (WIFSIGNALED(waitpid_status)) {
-				keep_trying = false;
-				/* If user did ctl-c, operf-record may get spurious errors, like
+	} else if (wait_rc) {
+		if (WIFEXITED(waitpid_status)) {
+			if (!WEXITSTATUS(waitpid_status)) {
+				cverb << vdebug << "operf-read process returned OK" << endl;
+			} else {
+				/* If user did ctl-c, operf-read may get spurious errors, like
 				 * broken pipe, etc.  We ignore these unless the user asks for
 				 * debug output.
 				 */
 				if (!ctl_c || cverb << vdebug) {
-					cerr << "operf-read process killed by signal "
-					     << WTERMSIG(waitpid_status) << endl;
-					rc = PERF_RECORD_ERROR;
+					cerr <<  "operf-read process ended abnormally.  Status = "
+							<< WEXITSTATUS(waitpid_status) << endl;
+					rc = rc ? PERF_BOTH_ERROR : PERF_READ_ERROR;
 				}
+			}
+		}  else if (WIFSIGNALED(waitpid_status)) {
+			/* If user did ctl-c, operf-read may get spurious errors, like
+			 * broken pipe, etc.  We ignore these unless the user asks for
+			 * debug output.
+			 */
+			if (!ctl_c || cverb << vdebug) {
+				cerr << "operf-read process killed by signal "
+						<< WTERMSIG(waitpid_status) << endl;
+				rc = PERF_RECORD_ERROR;
 			}
 		}
 	}
@@ -512,9 +538,13 @@ static end_code_t _kill_operf_record_pid(void)
 	end_code_t rc = ALL_OK;
 
 	// stop operf-record process
+	errno = 0;
 	if (kill(operf_record_pid, SIGUSR1) < 0) {
-		perror("Attempt to stop operf-record process failed");
-		rc = PERF_RECORD_ERROR;
+		// If operf-record process is already ended, don't consider this an error.
+		if (errno != ESRCH) {
+			perror("Attempt to stop operf-record process failed");
+			rc = PERF_RECORD_ERROR;
+		}
 	} else {
 		if (waitpid(operf_record_pid, &waitpid_status, 0) < 0) {
 			perror("waitpid for operf-record process failed");
@@ -573,29 +603,40 @@ static end_code_t _run(void)
 	/* If we're not doing system wide profiling and no app is started, then
 	 * there's no profile data to convert. So if this condition is NOT true,
 	 * then we'll do the convert.
-	 * Note that if --lazy-connversion is passed, then operf_options::post_conversion
+	 * Note that if --lazy-conversion is passed, then operf_options::post_conversion
 	 * will be set, and we will defer conversion until after the operf-record
 	 * process is done.
 	 */
 	if (!operf_options::post_conversion) {
 		if (!(!app_started && !operf_options::system_wide)) {
 			cverb << vdebug << "Forking read pid" << endl;
+			if (pipe(operf_post_profiling_pipe) < 0) {
+				perror("Internal error: operf-record could not create pipe");
+				_exit(EXIT_FAILURE);
+			}
 			operf_read_pid = fork();
 			if (operf_read_pid < 0) {
 				perror("Internal error: fork failed");
 				_exit(EXIT_FAILURE);
 			} else if (operf_read_pid == 0) { // child process
 				close(sample_data_pipe[1]);
+				close(operf_post_profiling_pipe[1]);
+				_set_basic_SIGINT_handler_for_child();
 				convert_sample_data();
+				_exit(EXIT_SUCCESS);
 			}
 			// parent
 			close(sample_data_pipe[0]);
 			close(sample_data_pipe[1]);
+			close(operf_convert_record_write_pipe[0]);
+			close(operf_convert_record_write_pipe[1]);
+			close(operf_record_convert_write_pipe[0]);
+			close(operf_record_convert_write_pipe[1]);
+			close(operf_post_profiling_pipe[0]);
 		}
 	}
 
-	set_signals();
-	cerr << "operf: Profiler started" << endl;
+	set_signals_for_parent();
 	if (startApp) {
 		/* The user passed in a command or program name to start, so we'll need to do waitpid on that
 		 * process.  However, while that user-requested process is running, it's possible we
@@ -605,37 +646,27 @@ static end_code_t _run(void)
 		 * process, checking their status.  The profiled app may end normally, abnormally, or by way
 		 * of ctrl-C.  The operf-record process should not end here, except abnormally.  The normal
 		 * flow is:
-		 *    1. profiled app ends or is stopped vi ctrl-C
+		 *    1. profiled app ends or is stopped via ctrl-C
 		 *    2. keep_trying is set to false, so we drop out of while loop and proceed to end of function
 		 *    3. call _kill_operf_record_pid and _kill_operf_read_pid
 		 */
-		struct timeval tv;
-		long long usec_timer;
 		bool keep_trying = true;
 		const char * app_process = "profiled app";
 		const char * record_process = "operf-record process";
 		waitpid_status = 0;
-		gettimeofday(&tv, NULL);
-		usec_timer = tv.tv_usec;
 		cverb << vdebug << "going into waitpid on profiled app " << app_PID << endl;
 
-		// We'll try the waitpid with WNOHANG once every 100,000 usecs.
+		// We'll try the waitpid with WNOHANG once every 100 ms (100,000,000 nsecs).
 		while (keep_trying) {
 			pid_t the_pid = app_PID;
 			int wait_rc;
 			const char * the_process = app_process;
-			gettimeofday(&tv, NULL);
-			/* If we exceed the 100000 usec interval or if the tv_usec
-			 * value has rolled over to restart at 0, then we reset
-			 * the usec_timer to current tv_usec and try waitpid.
-			 */
-			if ((tv.tv_usec % 1000000) > (usec_timer + 100000)
-					|| (tv.tv_usec < usec_timer))
-				usec_timer = tv.tv_usec;
-			else
-				continue;
-
 			bool trying_user_app = true;
+			struct timespec ts_req;
+			ts_req.tv_sec = 0;
+			ts_req.tv_nsec = 100000000;
+
+			(void)nanosleep(&ts_req, NULL);
 again:
 			if ((wait_rc = waitpid(the_pid, &waitpid_status, WNOHANG)) < 0) {
 				keep_trying = false;
@@ -708,10 +739,10 @@ again:
 		if (operf_options::post_conversion)
 			rc = _kill_operf_record_pid();
 		else
-			rc = _kill_operf_read_pid(_kill_operf_record_pid());
+			rc = _waitfor_operf_read_pid(_kill_operf_record_pid());
 	} else {
 		if (!operf_options::post_conversion)
-			rc = _kill_operf_read_pid(rc);
+			rc = _waitfor_operf_read_pid(rc);
 	}
 
 	return rc;
@@ -741,11 +772,15 @@ static void _jitconv_complete(int val __attribute__((unused)))
 	if (WIFEXITED(child_status) && (!WEXITSTATUS(child_status))) {
 		cverb << vdebug << "JIT dump processing complete." << endl;
 	} else {
-		 if (WIFSIGNALED(child_status))
-			 cerr << "child received signal " << WTERMSIG(child_status) << endl;
-		 else
+		 if (WIFSIGNALED(child_status)) {
+			 if (ctl_c)
+				 cerr << "JIT conversion stopped by request of user via ctl-c" << endl;
+			 else
+				 cerr << "child received signal " << WTERMSIG(child_status) << endl;
+		 } else {
 			 cerr << "JIT dump processing exited abnormally: "
-			 << WEXITSTATUS(child_status) << endl;
+			      << WEXITSTATUS(child_status) << endl;
+		 }
 	}
 }
 
@@ -765,14 +800,6 @@ static void _set_signals_for_convert(void)
 		perror("operf: install of SIGCHLD handler failed: ");
 		exit(EXIT_FAILURE);
 	}
-
-	act.sa_handler = _handle_sigint;
-	sigemptyset(&act.sa_mask);
-	sigaddset(&act.sa_mask, SIGINT);
-	if (sigaction(SIGINT, &act, NULL)) {
-		perror("operf: install of SIGINT handler failed: ");
-		exit(EXIT_FAILURE);
-	}
 }
 
 static void _do_jitdump_convert()
@@ -782,7 +809,7 @@ static void _do_jitdump_convert()
 	struct timeval tv;
 	char end_time_str[32];
 	char opjitconv_path[PATH_MAX + 1];
-	char * exec_args[8];
+	char * exec_args[9];
 
 	jitconv_pid = fork();
 	switch (jitconv_pid) {
@@ -794,6 +821,7 @@ static void _do_jitdump_convert()
 		const char * debug_option = "-d";
 		const char * non_root_user = "--non-root";
 		const char * delete_jitdumps = "--delete-jitdumps";
+		const char * sess_dir =  "--session-dir";
 		gettimeofday(&tv, NULL);
 		end_time = tv.tv_sec;
 		sprintf(end_time_str, "%llu", end_time);
@@ -805,6 +833,7 @@ static void _do_jitdump_convert()
 		if (my_uid != 0)
 			exec_args[arg_num++] = (char *)non_root_user;
 		exec_args[arg_num++] = (char *)delete_jitdumps;
+		exec_args[arg_num++] = (char *)sess_dir;
 		exec_args[arg_num++] = (char *)operf_options::session_dir.c_str();
 		exec_args[arg_num++] = start_time_str;
 		exec_args[arg_num++] = end_time_str;
@@ -836,18 +865,31 @@ static int __delete_old_previous_sample_data(const char *fpath,
 	}
 }
 
-/* Read perf_events sample data written by the operf-record process
- * through the sample_data_pipe and convert this to oprofile format
- * sample files.
+/* Read perf_events sample data written by the operf-record process through
+ * the sample_data_pipe or file (dependent on 'lazy-conversion' option)
+ * and convert the perf format sample data to to oprofile format sample files.
+ *
+ * If not invoked with --lazy-conversion option, this function is executed by
+ * the "operf-read" child process.  If user does a ctrl-C, the parent will
+ * execute _kill_operf_read_pid which will try to allow the conversion process
+ * to complete, waiting 5 seconds before it forcefully kills the operf-read
+ * process via 'kill SIGUSR1'.
+ *
+ * But if --lazy-conversion option is used, then it's the parent process that's
+ * running convert_sample_data.  If the user does a ctrl-C during this procedure,
+ * the ctrl-C is handled via op_sig_stop which essentially does nothing to stop
+ * the conversion procedure, which in general is fine.  On the very rare chance
+ * that the procedure gets stuck (hung) somehow, the user will have to do a
+ * 'kill -KILL'.
  */
 static void convert_sample_data(void)
 {
 	int inputfd;
 	string inputfname;
 	int rc = EXIT_SUCCESS;
-	int keep_waiting = 0;
 	string current_sampledir = samples_dir + "/current/";
 	string previous_sampledir = samples_dir + "/previous";
+	string stats_dir = "";
 	current_sampledir.copy(op_samples_current_dir, current_sampledir.length(), 0);
 
 	if (!app_started && !operf_options::system_wide)
@@ -888,7 +930,11 @@ static void convert_sample_data(void)
 		inputfd = sample_data_pipe[0];
 		inputfname = "";
 	}
-	operfRead.init(inputfd, inputfname, current_sampledir, cpu_type, events, operf_options::system_wide);
+	close(operf_record_convert_write_pipe[1]);
+	close(operf_convert_record_write_pipe[0]);
+	operfRead.init(inputfd, inputfname, current_sampledir, cpu_type,
+	               operf_options::system_wide, operf_convert_record_write_pipe[1],
+	               operf_record_convert_write_pipe[0], operf_post_profiling_pipe[0]);
 	if ((rc = operfRead.readPerfHeader()) < 0) {
 		if (rc != OP_PERF_HANDLED_ERROR)
 			cerr << "Error: Cannot create read header info for sample data " << endl;
@@ -898,495 +944,27 @@ static void convert_sample_data(void)
 	cverb << vdebug << "Successfully read header info for sample data " << endl;
 	if (operfRead.is_valid()) {
 		try {
-			int num = operfRead.convertPerfData();
+			unsigned int num = operfRead.convertPerfData();
 			cverb << vdebug << "operf_read: Total bytes received from operf_record process: " << dec << num << endl;
-		} catch (runtime_error e) {
+		} catch (const runtime_error & e) {
 			cerr << "Caught runtime error from operf_read::convertPerfData" << endl;
 			cerr << e.what() << endl;
 			rc = EXIT_FAILURE;
 			goto out;
 		}
 	}
+
 	_set_signals_for_convert();
 	cverb << vdebug << "Calling _do_jitdump_convert" << endl;
 	_do_jitdump_convert();
-	while (jit_conversion_running && (keep_waiting < 2)) {
+	while (jit_conversion_running) {
 		sleep(1);
-		keep_waiting++;
-	}
-	if (jit_conversion_running) {
-		kill(jitconv_pid, SIGKILL);
 	}
 out:
 	if (!operf_options::post_conversion)
 		_exit(rc);
 }
 
-
-static int find_app_file_in_dir(const struct dirent * d)
-{
-	if (!strcmp(d->d_name, app_name))
-		return 1;
-	else
-		return 0;
-}
-
-static int get_PATH_based_pathname(char * path_holder, size_t n)
-{
-	int retval = -1;
-
-	char * real_path = getenv("PATH");
-	char * path = (char *) xstrdup(real_path);
-	char * segment = strtok(path, ":");
-	while (segment) {
-		struct dirent ** namelist;
-		int rc = scandir(segment, &namelist, find_app_file_in_dir, NULL);
-		if (rc < 0) {
-			if (errno != ENOENT) {
-				cerr << strerror(errno) << endl;
-				cerr << app_name << " cannot be found in your PATH." << endl;
-				break;
-			}
-		} else if (rc == 1) {
-			size_t applen = strlen(app_name);
-			size_t dirlen = strlen(segment);
-
-			if (applen + dirlen + 2 > n) {
-				cerr << "Path segment " << segment
-				     << " prepended to the passed app name is too long"
-				     << endl;
-				retval = -1;
-				break;
-			}
-
-			if (!strcmp(segment, ".")) {
-				if (getcwd(path_holder, PATH_MAX) == NULL) {
-					retval = -1;
-					cerr << "getcwd [3] failed when processing <cur-dir>/" << app_name << " found via PATH. Aborting."
-							<< endl;
-					break;
-				}
-			} else {
-				strncpy(path_holder, segment, dirlen);
-			}
-			strcat(path_holder, "/");
-			strncat(path_holder, app_name, applen);
-			retval = 0;
-			free(namelist[0]);
-			free(namelist);
-
-			break;
-		}
-		segment = strtok(NULL, ":");
-	}
-	free(path);
-	return retval;
-}
-int validate_app_name(void)
-{
-	int rc = 0;
-	struct stat filestat;
-	size_t len = strlen(app_name);
-
-	if (len > (size_t) (OP_APPNAME_LEN - 1)) {
-		cerr << "app name longer than max allowed (" << OP_APPNAME_LEN
-		     << " chars)\n";
-		cerr << app_name << endl;
-		rc = -1;
-		goto out;
-	}
-
-	if (index(app_name, '/') == app_name) {
-		// Full pathname of app was specified, starting with "/".
-		strncpy(full_pathname, app_name, len);
-	} else if ((app_name[0] == '.') && (app_name[1] == '/')) {
-		// Passed app is in current directory; e.g., "./myApp"
-		if (getcwd(full_pathname, PATH_MAX) == NULL) {
-			rc = -1;
-			cerr << "getcwd [1] failed when trying to find app name " << app_name << ". Aborting."
-			     << endl;
-			goto out;
-		}
-		strcat(full_pathname, "/");
-		strcat(full_pathname, (app_name + 2));
-	} else if (index(app_name, '/')) {
-		// Passed app is in a subdirectory of cur dir; e.g., "test-stuff/myApp"
-		if (getcwd(full_pathname, PATH_MAX) == NULL) {
-			rc = -1;
-			cerr << "getcwd [2] failed when trying to find app name " << app_name << ". Aborting."
-			     << endl;
-			goto out;
-		}
-		strcat(full_pathname, "/");
-		strcat(full_pathname, app_name);
-	} else {
-		// Passed app name, at this point, MUST be found in PATH
-		rc = get_PATH_based_pathname(full_pathname, PATH_MAX);
-	}
-
-	if (rc) {
-		cerr << "Problem finding app name " << app_name << ". Aborting."
-		     << endl;
-		goto out;
-	}
-	app_name_SAVE = app_name;
-	app_name = full_pathname;
-	if (stat(app_name, &filestat)) {
-		char msg[OP_APPNAME_LEN + 50];
-		snprintf(msg, OP_APPNAME_LEN + 50, "Non-existent app name \"%s\"",
-		         app_name);
-		perror(msg);
-		rc = -1;
-	}
-
-	out: return rc;
-}
-
-static void _get_event_code(operf_event_t * event)
-{
-	FILE * fp;
-	char oprof_event_code[9];
-	string command;
-	u64 base_code, config;
-	char buf[20];
-	if ((snprintf(buf, 20, "%lu", event->count)) < 0) {
-		cerr << "Error parsing event count of " << event->count << endl;
-		exit(EXIT_FAILURE);
-	}
-
-	base_code = config = 0ULL;
-
-	command = OP_BINDIR;
-	command += "ophelp ";
-	command += event->name;
-
-	fp = popen(command.c_str(), "r");
-	if (fp == NULL) {
-		cerr << "Unable to execute ophelp to get info for event "
-		     << event->name << endl;
-		exit(EXIT_FAILURE);
-	}
-	if (fgets(oprof_event_code, sizeof(oprof_event_code), fp) == NULL) {
-		pclose(fp);
-		cerr << "Unable to find info for event "
-		     << event->name << endl;
-		exit(EXIT_FAILURE);
-	}
-
-	pclose(fp);
-
-	base_code = strtoull(oprof_event_code, (char **) NULL, 10);
-
-
-#if defined(__i386__) || defined(__x86_64__)
-	// Setup EventSelct[11:8] field for AMD
-	char mask[12];
-	const char * vendor_AMD = "AuthenticAMD";
-	if (op_is_cpu_vendor((char *)vendor_AMD)) {
-		config = base_code & 0xF00ULL;
-		config = config << 32;
-	}
-
-	// Setup EventSelct[7:0] field
-	config |= base_code & 0xFFULL;
-
-	// Setup unitmask field
-	if (event->um_name[0]) {
-		command = OP_BINDIR;
-		command += "ophelp ";
-		command += "--extra-mask ";
-		command += event->name;
-		command += ":";
-		command += buf;
-		command += ":";
-		command += event->um_name;
-		fp = popen(command.c_str(), "r");
-		if (fp == NULL) {
-			cerr << "Unable to execute ophelp to get info for event "
-			     << event->name << endl;
-			exit(EXIT_FAILURE);
-		}
-		if (fgets(mask, sizeof(mask), fp) == NULL) {
-			pclose(fp);
-			cerr << "Unable to find unit mask info for " << event->um_name << " for event "
-			     << event->name << endl;
-			exit(EXIT_FAILURE);
-		}
-		pclose(fp);
-		config |= strtoull(mask, (char **) NULL, 10);
-	} else if (!event->evt_um) {
-		command.clear();
-		command = OP_BINDIR;
-		command += "ophelp ";
-		command += "--unit-mask ";
-		command += event->name;
-		command += ":";
-		command += buf;
-		fp = popen(command.c_str(), "r");
-		if (fp == NULL) {
-			cerr << "Unable to execute ophelp to get unit mask for event "
-			     << event->name << endl;
-			exit(EXIT_FAILURE);
-		}
-		if (fgets(mask, sizeof(mask), fp) == NULL) {
-			pclose(fp);
-			cerr << "Unable to find unit mask info for event " << event->name << endl;
-			exit(EXIT_FAILURE);
-		}
-		pclose(fp);
-		config |= ((strtoull(mask, (char **) NULL, 10) & 0xFFULL) << 8);
-	} else {
-		config |= ((event->evt_um & 0xFFULL) << 8);
-	}
-#else
-	config = base_code;
-#endif
-
-	event->op_evt_code = base_code;
-	event->evt_code = config;
-}
-
-#if (defined(__powerpc__) || defined(__powerpc64__))
-/* All ppc64 events (except CYCLES) have a _GRP<n> suffix.  This is
- * because the legacy opcontrol profiler can only profile events in
- * the same group (i.e., having the same _GRP<n> suffix).  But operf
- * can multiplex events, so we should allow the user to pass event
- * names without the _GRP<n> suffix.
- *
- * If event name is not CYCLES or does not have a _GRP<n> suffix,
- * we'll call ophelp and scan the list of events, searching for one
- * that matches up to the _GRP<n> suffix.  If we don't find a match,
- * then we'll exit with the expected error message for invalid event name.
- */
-static string _handle_powerpc_event_spec(string event_spec)
-{
-	FILE * fp;
-	char line[MAX_INPUT];
-	size_t grp_pos;
-	string evt, retval, err_msg;
-	size_t evt_name_len;
-	bool first_non_cyc_evt_found = false;
-	bool event_found = false;
-	char event_name[OP_MAX_EVT_NAME_LEN], event_spec_str[OP_MAX_EVT_NAME_LEN + 20], * count_str;
-	string cmd = OP_BINDIR;
-	cmd += "/ophelp";
-
-	strncpy(event_spec_str, event_spec.c_str(), event_spec.length() + 1);
-
-	strncpy(event_name, strtok(event_spec_str, ":"), OP_MAX_EVT_NAME_LEN);
-	count_str = strtok(NULL, ":");
-	if (!count_str) {
-		err_msg = "Invalid count for event ";
-		goto out;
-	}
-
-	if (!strcmp("CYCLES", event_name)) {
-		event_found = true;
-		goto out;
-	}
-
-	evt = event_name;
-	// Need to make sure the event name truly has a _GRP<n> suffix.
-	grp_pos = evt.rfind("_GRP");
-	if ((grp_pos != string::npos) && ((evt = evt.substr(grp_pos, string::npos))).length() > 4) {
-		char * end;
-		strtoul(evt.substr(4, string::npos).c_str(), &end, 0);
-		if (end && (*end == '\0')) {
-		// Valid group number found after _GRP, so we can skip to the end.
-			event_found = true;
-			goto out;
-		}
-	}
-
-	// If we get here, it implies the user passed a non-CYCLES event without a GRP suffix.
-	// Lets try to find a valid suffix for it.
-	fp = popen(cmd.c_str(), "r");
-	if (fp == NULL) {
-		cerr << "Unable to execute ophelp to get info for event "
-		     << event_spec << endl;
-		exit(EXIT_FAILURE);
-	}
-	evt_name_len = strlen(event_name);
-	err_msg = "Cannot find event ";
-	while (fgets(line, MAX_INPUT, fp)) {
-		if (!first_non_cyc_evt_found) {
-			if (!strncmp(line, "PM_", 3))
-				first_non_cyc_evt_found = true;
-			else
-				continue;
-		}
-		if (line[0] == ' ' || line[0] == '\t')
-			continue;
-		if (!strncmp(line, event_name, evt_name_len)) {
-			// Found a potential match.  Check if it's a perfect match.
-			string save_event_name = event_name;
-			size_t full_evt_len = index(line, ':') - line;
-			memset(event_name, '\0', OP_MAX_EVT_NAME_LEN);
-			strncpy(event_name, line, full_evt_len);
-			string candidate = event_name;
-			if (candidate.rfind("_GRP") == evt_name_len) {
-				event_found = true;
-				break;
-			} else {
-				memset(event_name, '\0', OP_MAX_EVT_NAME_LEN);
-				strncpy(event_name, save_event_name.c_str(), evt_name_len);
-			}
-		}
-	}
-	pclose(fp);
-
-out:
-	if (!event_found) {
-		cerr << err_msg << event_name << endl;
-		cerr << "Error retrieving info for event "
-				<< event_spec << endl;
-		exit(EXIT_FAILURE);
-	}
-	retval = event_name;
-	return retval + ":" + count_str;
-}
-#endif
-
-static void _process_events_list(void)
-{
-	string cmd = OP_BINDIR;
-	cmd += "/ophelp --check-events ";
-	for (unsigned int i = 0; i <  operf_options::evts.size(); i++) {
-		FILE * fp;
-		string full_cmd = cmd;
-		string event_spec = operf_options::evts[i];
-
-#if (defined(__powerpc__) || defined(__powerpc64__))
-		event_spec = _handle_powerpc_event_spec(event_spec);
-#endif
-
-		if (operf_options::callgraph) {
-			full_cmd += " --callgraph=1 ";
-		}
-		full_cmd += event_spec;
-		fp = popen(full_cmd.c_str(), "r");
-		if (fp == NULL) {
-			cerr << "Unable to execute ophelp to get info for event "
-			     << event_spec << endl;
-			exit(EXIT_FAILURE);
-		}
-		if (fgetc(fp) == EOF) {
-			pclose(fp);
-			cerr << "Error retrieving info for event "
-			     << event_spec << endl;
-			if (operf_options::callgraph)
-				cerr << "Note: When doing callgraph profiling, the sample count must be"
-				     << endl << "15 times the minimum count value for the event."  << endl;
-			exit(EXIT_FAILURE);
-		}
-		fclose(fp);
-		char * event_str = op_xstrndup(event_spec.c_str(), event_spec.length());
-		operf_event_t event;
-		strncpy(event.name, strtok(event_str, ":"), OP_MAX_EVT_NAME_LEN);
-		event.count = atoi(strtok(NULL, ":"));
-		/* Name and count are required in the event spec in order for
-		 * 'ophelp --check-events' to pass.  But since unit mask and domain
-		 * control bits are optional, we need to ensure the result of strtok
-		 * is valid.
-		 */
-		char * info;
-#define	_OP_UM 1
-#define	_OP_KERNEL 2
-#define	_OP_USER 3
-		int place =  _OP_UM;
-		char * endptr = NULL;
-		event.evt_um = 0ULL;
-		event.no_kernel = 0;
-		event.no_user = 0;
-		memset(event.um_name, '\0', OP_MAX_UM_NAME_LEN);
-		while ((info = strtok(NULL, ":"))) {
-			switch (place) {
-			case _OP_UM:
-				event.evt_um = strtoul(info, &endptr, 0);
-				// If any of the UM part is not a number, then we
-				// consider the entire part a string.
-				if (*endptr) {
-					event.evt_um = 0;
-					strncpy(event.um_name, info, OP_MAX_UM_NAME_LEN);
-				}
-				break;
-			case _OP_KERNEL:
-				if (atoi(info) == 0)
-					event.no_kernel = 1;
-				break;
-			case _OP_USER:
-				if (atoi(info) == 0)
-					event.no_user = 1;
-				break;
-			}
-			place++;
-		}
-		free(event_str);
-		_get_event_code(&event);
-		events.push_back(event);
-	}
-#if (defined(__powerpc__) || defined(__powerpc64__))
-	{
-		/* This section of code is for architectures such as ppc[64] for which
-		 * the oprofile event code needs to be converted to the appropriate event
-		 * code to pass to the perf_event_open syscall.
-		 */
-
-		using namespace OP_perf_utils;
-		if (!op_convert_event_vals(&events)) {
-			cerr << "Unable to convert all oprofile event values to perf_event values" << endl;
-			exit(EXIT_FAILURE);
-		}
-	}
-#endif
-}
-
-static void get_default_event(void)
-{
-	operf_event_t dft_evt;
-	struct op_default_event_descr descr;
-	vector<operf_event_t> tmp_events;
-
-
-	op_default_event(cpu_type, &descr);
-	if (descr.name[0] == '\0') {
-		cerr << "Unable to find default event" << endl;
-		exit(EXIT_FAILURE);
-	}
-
-	memset(&dft_evt, 0, sizeof(dft_evt));
-	if (operf_options::callgraph) {
-		struct op_event * _event;
-		op_events(cpu_type);
-		if ((_event = find_event_by_name(descr.name, 0, 0))) {
-			dft_evt.count = _event->min_count * CALLGRAPH_MIN_COUNT_SCALE;
-		} else {
-			cerr << "Error getting event info for " << descr.name << endl;
-			exit(EXIT_FAILURE);
-		}
-	} else {
-		dft_evt.count = descr.count;
-	}
-	dft_evt.evt_um = descr.um;
-	strncpy(dft_evt.name, descr.name, OP_MAX_EVT_NAME_LEN - 1);
-	_get_event_code(&dft_evt);
-	events.push_back(dft_evt);
-
-#if (defined(__powerpc__) || defined(__powerpc64__))
-	{
-		/* This section of code is for architectures such as ppc[64] for which
-		 * the oprofile event code needs to be converted to the appropriate event
-		 * code to pass to the perf_event_open syscall.
-		 */
-
-		using namespace OP_perf_utils;
-		if (!op_convert_event_vals(&events)) {
-			cerr << "Unable to convert all oprofile event values to perf_event values" << endl;
-			exit(EXIT_FAILURE);
-		}
-	}
-#endif
-}
 
 static void _process_session_dir(void)
 {
@@ -1396,6 +974,10 @@ static void _process_session_dir(void)
 		cwd = (char *) xmalloc(PATH_MAX);
 		// set default session dir
 		cwd = getcwd(cwd, PATH_MAX);
+		if (cwd == NULL) {
+			perror("Error calling getcwd");
+			exit(EXIT_FAILURE);
+		}
 		operf_options::session_dir = cwd;
 		operf_options::session_dir +="/oprofile_data";
 		samples_dir = operf_options::session_dir + "/samples";
@@ -1432,6 +1014,7 @@ static void _process_session_dir(void)
 			exit(EXIT_FAILURE);
 		}
 	}
+
 	cverb << vdebug << "Using samples dir " << samples_dir << endl;
 }
 
@@ -1478,6 +1061,107 @@ bool _get_vmlinux_address_info(vector<string> args, string cmp_val, string &str)
 			exit(EXIT_FAILURE);
 	}
 	return found;
+}
+
+static bool _add_kernel_entry(string start_addr_str, string end_addr_str, string image_name)
+{
+	string str, start_end;
+	unsigned long long start_addr, end_addr;
+
+	errno = 0;
+	start_addr = strtoull(start_addr_str.c_str(), NULL, 16);
+	if (errno) {
+		cerr << "Unable to convert kallsyms start address " << start_addr_str
+		     << " to a valid hex value. errno is " << strerror(errno) << endl;
+		return false;
+	}
+
+	errno = 0;
+	end_addr =  strtoull(end_addr_str.c_str(), NULL, 16);
+	if (errno) {
+		cerr << "Unable to convert kallsyms end address " << end_addr_str
+		     << " to a valid hex value. errno is " << strerror(errno) << endl;
+		return false;
+	}
+
+	if ((start_addr == 0) || (end_addr == 0)) {
+		no_vmlinux = true;
+		cerr << "Kernel profiling is not possible with current system "
+		     << "config." << endl
+		     << "Set /proc/sys/kernel/kptr_restrict to 0 to "
+		     << "collect kernel samples." << endl;
+		return false;
+	}
+
+	/* Do not assign kernel_start and kernel_end until the addresses
+	 * have been validated.
+	 */
+	kernel_start = start_addr;
+	kernel_end = end_addr;
+
+	start_end = start_addr_str;
+	start_end.append(",");
+	start_end.append(end_addr_str);
+
+	no_vmlinux = false;  // set to false or the operf_get_vmlinux_name() returns "no-vmlinux"
+	operf_create_vmlinux(image_name.c_str(), start_end.c_str());
+	return true;
+}
+
+static bool _process_kallsyms(void)
+{
+	ifstream  infile;
+	string start_addr_str, end_addr_str;
+	string address_str;
+	string str, start_end;
+	std::string line;
+	stringstream iss;
+	string name;
+	string kall_syms_file = KALL_SYM_FILE;
+	char type;
+	int rtn = false;
+
+	infile.open(kall_syms_file.c_str());
+	if (!infile) {
+		cerr << "Internal Error: Could not open kallsyms file." << endl;
+		return false;
+	}
+
+	start_addr_str.clear();
+	end_addr_str.clear();
+
+	/* get the start and end  address of the kernel address range */
+	while ( !infile.eof() ) {
+		getline(infile, line);
+		iss.clear();
+		iss << line;
+		address_str.clear();
+
+		iss >> address_str;
+		iss >> type;
+		iss >> name;
+
+		if (strncmp(name.c_str(), KERN_ADDR_SPACE_START_SYMBOL,
+			    strlen(name.c_str())) == 0) {
+			/* found the symbol for the start of the kernel
+			 * address space.
+			*/
+			start_addr_str.assign(address_str);
+		}
+
+		if (strncmp(name.c_str(), KERN_ADDR_SPACE_END_SYMBOL,
+			    strlen(name.c_str())) == 0) {
+			/* found the symbol for the end of the kernel
+			 * address space.
+			 */
+			end_addr_str.assign(address_str);
+			rtn = _add_kernel_entry(start_addr_str,
+						  end_addr_str, KALL_SYM_FILE);
+			break;
+		}
+	}
+	infile.close();
+	return rtn;
 }
 
 string _process_vmlinux(string vmlinux_file)
@@ -1575,6 +1259,7 @@ static int _process_operf_and_app_args(int argc, char * const argv[])
 {
 	bool keep_trying = true;
 	int idx_of_non_options = 0;
+	char * prev_env = getenv("POSIXLY_CORRECT");
 	setenv("POSIXLY_CORRECT", "1", 0);
 	while (keep_trying) {
 		int option_idx = 0;
@@ -1621,7 +1306,7 @@ static int _process_operf_and_app_args(int argc, char * const argv[])
 		case 'e':
 			event = strtok(optarg, ",");
 			do {
-				operf_options::evts.push_back(event);
+				operf_options::evts.insert(event);
 			} while ((event = strtok(NULL, ",")));
 			break;
 		case 'c':
@@ -1648,6 +1333,10 @@ static int _process_operf_and_app_args(int argc, char * const argv[])
 			__print_usage_and_exit("unexpected end of arg parsing");
 		}
 	}
+
+	if (prev_env == NULL)
+		unsetenv("POSIXLY_CORRECT");
+
 	return idx_of_non_options;
 }
 
@@ -1676,7 +1365,7 @@ static void process_args(int argc, char * const argv[])
 			app_args = (char **) xmalloc((sizeof *app_args) * 2);
 			app_args[1] = NULL;
 		}
-		if (validate_app_name() < 0) {
+		if (op_validate_app_name(&app_name, &app_name_SAVE) < 0) {
 			__print_usage_and_exit(NULL);
 		}
 	} else {  // non_options_idx == 0
@@ -1707,40 +1396,31 @@ static void process_args(int argc, char * const argv[])
 
 	if (operf_options::evts.empty()) {
 		// Use default event
-		get_default_event();
+		op_get_default_event(operf_options::callgraph);
 	} else  {
-		_process_events_list();
+		op_process_events_list(operf_options::evts, true, operf_options::callgraph);
 	}
-	op_nr_counters = events.size();
+	op_nr_events = events.size();
 
 	if (operf_options::vmlinux.empty()) {
-		no_vmlinux = true;
-		operf_create_vmlinux(NULL, NULL);
+		/* get the begining and end of the kernel addr space */
+		if (!_process_kallsyms()) {
+			/* Do not have permission to read
+			 * kernel addresses from /proc/kallsyms.
+			 */
+			no_vmlinux = true;
+			operf_create_vmlinux(NULL, NULL);
+		}
 	} else {
 		string startEnd = _process_vmlinux(operf_options::vmlinux);
 		operf_create_vmlinux(operf_options::vmlinux.c_str(), startEnd.c_str());
 	}
+	if (operf_options::pid && !operf_options::post_conversion)
+		track_new_forks = true;
+	else
+		track_new_forks = false;
 
 	return;
-}
-
-static int _check_perf_events_cap(void)
-{
-	/* If perf_events syscall is not implemented, the syscall below will fail
-	 * with ENOSYS (38).  If implemented, but the processor type on which this
-	 * program is running is not supported by perf_events, the syscall returns
-	 * ENOENT (2).
-	 */
-	struct perf_event_attr attr;
-	pid_t pid ;
-        memset(&attr, 0, sizeof(attr));
-        attr.size = sizeof(attr);
-        attr.sample_type = PERF_SAMPLE_IP;
-
-	pid = getpid();
-	syscall(__NR_perf_event_open, &attr, pid, 0, -1, 0);
-	return errno;
-
 }
 
 static void _precheck_permissions_to_samplesdir(string sampledir, bool for_current)
@@ -1773,57 +1453,73 @@ static void _precheck_permissions_to_samplesdir(string sampledir, bool for_curre
 
 }
 
-static int _get_sys_value(const char * filename)
-{
-	char str[10];
-	int _val = -999;
-	FILE * fp = fopen(filename, "r");
-	if (fp == NULL)
-		return _val;
-	if (fgets(str, 9, fp))
-		sscanf(str, "%d", &_val);
-	fclose(fp);
-	return _val;
-}
-
-
 int main(int argc, char * const argv[])
 {
 	int rc;
+	int perf_event_paranoid = op_get_sys_value("/proc/sys/kernel/perf_event_paranoid");
+
+	my_uid = geteuid();
 	throttled = false;
-	if ((rc = _check_perf_events_cap())) {
-		if (rc == EBUSY) {
-			cerr << "Performance monitor unit is busy.  Do 'opcontrol --deinit' and try again." << endl;
-			exit(1);
+	rc = op_check_perf_events_cap(use_cpu_minus_one);
+	if (rc == EACCES) {
+		/* Early perf_events kernels required the cpu argument to perf_event_open
+		 * to be '-1' when setting up to profile a single process if 1) the user is
+		 * not root; and 2) perf_event_paranoid is > 0.  An EACCES error would be
+		 * returned if passing '0' or greater for the cpu arg and the above criteria
+		 * was not met.  Unfortunately, later kernels turned this requirement around
+		 * such that the passed cpu arg must be '0' or greater when the user is not
+		 * root.
+		 *
+		 * We don't really have a good way to check whether we're running on such an
+		 * early kernel except to try the perf_event_open with different values to see
+		 * what works.
+		 */
+		if (my_uid != 0 && perf_event_paranoid > 0) {
+			use_cpu_minus_one = true;
+			rc = op_check_perf_events_cap(use_cpu_minus_one);
 		}
-		if (rc == ENOSYS) {
-			cerr << "Your kernel does not implement a required syscall"
-			     << "  for the operf program." << endl;
-		} else if (rc == ENOENT) {
-			cerr << "Your kernel's Performance Events Subsystem does not support"
-			     << " your processor type." << endl;
-		} else {
-			cerr << "Unexpected error running operf: " << strerror(rc) << endl;
-		}
-		cerr << "Please use the opcontrol command instead of operf." << endl;
-		exit(1);
+	}
+	if (rc == EBUSY) {
+		cerr << "Performance monitor unit is busy.  Ensure that no other profilers are running on the system." << endl
+		     << "Note: For example, the obsolete opcontrol profiler (available in earlier oprofile releases)" << endl
+		     << "does not allow other perforrmance tools to run simultaneously. To check for this, look for the" << endl
+		     << "'oprofiled' process using the 'ps' command." << endl;
+	} else if (rc == ENOSYS) {
+		cerr << "Your kernel does not implement a required syscall"
+		     << " for the operf program." << endl;
+	} else if (rc == ENOENT) {
+		cerr << "Your kernel's Performance Events Subsystem does not support"
+		     << " your processor type." << endl;
+	} else if (rc) {
+		cerr << "Unexpected error running operf: " << strerror(rc) << endl;
 	}
 
-	cpu_type = op_get_cpu_type();
-	cpu_speed = op_cpu_frequency();
-	process_args(argc, argv);
+	if (rc)
+		exit(1);
 
-	int perf_event_paranoid = _get_sys_value("/proc/sys/kernel/perf_event_paranoid");
-	my_uid = geteuid();
-	if (operf_options::system_wide && ((my_uid != 0) && (perf_event_paranoid > 0))) {
-		cerr << "To do system-wide profiling, either you must be root or" << endl;
-		cerr << "/proc/sys/kernel/perf_event_paranoid must be set to 0 or -1." << endl;
+	cpu_type = op_get_cpu_type();
+	if (cpu_type == CPU_NO_GOOD) {
+		cerr << "Unable to ascertain cpu type.  Exiting." << endl;
 		cleanup();
 		exit(1);
 	}
 
-	if (cpu_type == CPU_NO_GOOD) {
-		cerr << "Unable to ascertain cpu type.  Exiting." << endl;
+	if (cpu_type == CPU_TIMER_INT) {
+		cerr << "CPU type 'timer' was detected, but operf does not support timer mode." << endl
+		     << "Ensure the obsolete opcontrol profiler (available in earlier oprofile releases)" << endl
+		     << "is not running on the system.  To check for this, look for the file" << endl
+		     << "/dev/oprofile/cpu_type; if this file exists, locate the pre-1.0 oprofile" << endl
+		     << "installation, and use its 'opcontrol' command with the --deinit option." << endl;
+		cleanup();
+		exit(1);
+	}
+
+	cpu_speed = op_cpu_frequency();
+	process_args(argc, argv);
+
+	if (operf_options::system_wide && ((my_uid != 0) && (perf_event_paranoid > 0))) {
+		cerr << "To do system-wide profiling, either you must be root or" << endl;
+		cerr << "/proc/sys/kernel/perf_event_paranoid must be set to 0 or -1." << endl;
 		cleanup();
 		exit(1);
 	}
@@ -1838,7 +1534,7 @@ int main(int argc, char * const argv[])
 			_precheck_permissions_to_samplesdir(previous_sampledir, for_current);
 		}
 	}
-	kptr_restrict = _get_sys_value("/proc/sys/kernel/kptr_restrict");
+	kptr_restrict = op_get_sys_value("/proc/sys/kernel/kptr_restrict");
 	end_code_t run_result;
 	if ((run_result = _run())) {
 		if (startApp && app_started && (run_result != APP_ABNORMAL_END)) {

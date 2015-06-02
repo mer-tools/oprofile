@@ -11,9 +11,10 @@
 
 AC_PREREQ(2.13)
 
-AC_INIT(libop/op_config.h)
-AM_INIT_AUTOMAKE(oprofile, 0.9.9git)
-AM_CONFIG_HEADER(config.h)
+AC_INIT([OProfile], [1.1.0git])
+AC_CONFIG_SRCDIR([libop/op_config.h])
+AM_INIT_AUTOMAKE
+AC_CONFIG_HEADERS(config.h)
 
 AC_CHECK_DECLS([basename], [], [], [[#include <libgen.h>]])
 AC_PROG_RANLIB
@@ -56,7 +57,7 @@ AC_PROG_CC
 AC_PROG_CPP
 AC_PROG_CXX
 AC_CHECK_PROG(LD,ld,ld,)
-test "$LD" || AC_ERROR(ld not found)
+test "$LD" || AC_MSG_ERROR(ld not found)
 
 # --with-kernel for cross compilation
 AC_ARG_WITH(kernel,
@@ -65,16 +66,21 @@ If this option is not specified, configure will look for kernel header files in 
 for a kernel-headers package -- /usr. Use this option in cross-compile enviroments
 or in situations where the host system does not support perf_events but you wish to build binaries
 for a target system that does support perf_events. Because of OProfile's use of syscalls,
-kernel headers used during build must match the architecture of the intended target system.])],
+kernel headers used during build must match the architecture of the intended target system.
+NOTE:  Run the command 'make headers_install INSTALL_HDR_PATH=<kernel-hdrs-install-dir>'
+from the root directory of your kernel source tree, and use <kernel-hdrs-install-dir> for
+oprofile's '--with-kernel' configure option.])],
 KERNELDIR=$withval)
 
 
 dnl Check kernel version for perf_events supported
 if test "$KERNELDIR" != ""; then
-	KINC="$KERNELDIR/include"
-	PERF_EVENT_FLAGS=" -I$KERNELDIR/include"
-	AC_SUBST(PERF_EVENT_FLAGS)
-	PERF_EVENT_H="$KERNELDIR/include/linux/perf_event.h"
+	if test -d $KERNELDIR; then
+		KINC="$KERNELDIR/include"
+		PERF_EVENT_FLAGS=" -I$KERNELDIR/include"
+		AC_SUBST(PERF_EVENT_FLAGS)
+		PERF_EVENT_H="$KERNELDIR/include/linux/perf_event.h"
+	fi
 else
 	PERF_EVENT_H="/usr/include/linux/perf_event.h"
 fi
@@ -83,6 +89,10 @@ PERF_EVENT_H_EXISTS="no"
 kernel_may_have_perf_events_support="no"
 AX_KERNEL_VERSION(2, 6, 31, <=, kernel_may_have_perf_events_support="yes",
 kernel_has_perf_events_support="no")
+
+if test "$kernel_has_perf_events_support" = "no"; then
+	AC_MSG_ERROR(Your kernel version is older than the required level (2.6.31) to build oprofile.)
+fi
 
 dnl The AX_KERNEL_VERSION macro may return kernel_may_have_perf_events_support="yes",
 dnl indicating a partial answer.  Some architectures do not implement the Performance
@@ -127,48 +137,84 @@ else
 	kernel_has_perf_events_support="no"
 fi
 
+if test "$kernel_has_perf_events_support" != "yes"; then
+	if test "$KERNELDIR" != ""; then
+		echo "ERROR: You requested to build oprofile with '--with-kernel=$KERNELDIR',"
+		if ! test -d $KERNELDIR; then
+			echo "but that directory does not exist."
+		elif test "$PERF_EVENT_H_EXISTS" != "yes"; then
+			echo "but headers were not accessible at the given location."
+			echo "Be sure you have run the following command from within your kernel source tree:"
+			echo "     make headers_install INSTALL_HDR_PATH=<kernel-hdrs-install-dir>"
+			echo "Then pass <kernel-hdrs-install-dir> to oprofile's '--with-kernel' configure option."
+		else
+			echo "but your kernel does not appear to have the necessary support to run oprofile."
+		fi
+	else
+		if test "$PERF_EVENT_H_EXISTS" != "yes"; then
+			echo "Error: perf_event.h not found.  Either install the kernel headers package or"
+			echo "use the --with-kernel option."
+		else
+			echo "Error: Your kernel does not appear to have the necessary support to run oprofile."
+		fi
+	fi
+	AC_MSG_ERROR(Unable to build oprofile. Exiting.)
+fi
+
 AM_CONDITIONAL(BUILD_FOR_PERF_EVENT, test "$kernel_has_perf_events_support" = "yes")
 
-if test "$kernel_has_perf_events_support" = "yes"; then
-	HAVE_PERF_EVENTS='1'
-	AC_MSG_CHECKING([whether PERF_RECORD_MISC_GUEST_KERNEL is defined in perf_event.h])
-	rm -f test-for-PERF_GUEST
-	AC_LANG_CONFTEST(
-		[AC_LANG_PROGRAM([[#include <linux/perf_event.h>]],
-			[[unsigned int pr_guest_kern = PERF_RECORD_MISC_GUEST_KERNEL;
-			unsigned int pr_guest_user = PERF_RECORD_MISC_GUEST_USER;]])
-		])
-	$CC conftest.$ac_ext $CFLAGS $LDFLAGS $LIBS $PERF_EVENT_FLAGS -o test-for-PERF_GUEST  > /dev/null 2>&1
-	if test -f test-for-PERF_GUEST; then
-		echo "yes"
-		HAVE_PERF_GUEST_MACROS='1'
-	else
-		echo "no"
-		HAVE_PERF_GUEST_MACROS='0'
-	fi
-	AC_DEFINE_UNQUOTED(HAVE_PERF_GUEST_MACROS, $HAVE_PERF_GUEST_MACROS, [PERF_RECORD_MISC_GUEST_KERNEL is defined in perf_event.h])
-	rm -f test-for-PERF_GUEST*
+
+HAVE_PERF_EVENTS='1'
+AC_MSG_CHECKING([whether PERF_RECORD_MISC_GUEST_KERNEL is defined in perf_event.h])
+rm -f test-for-PERF_GUEST
+AC_LANG_CONFTEST(
+	[AC_LANG_PROGRAM([[#include <linux/perf_event.h>]],
+		[[unsigned int pr_guest_kern = PERF_RECORD_MISC_GUEST_KERNEL;
+		unsigned int pr_guest_user = PERF_RECORD_MISC_GUEST_USER;]])
+	])
+$CC conftest.$ac_ext $CFLAGS $LDFLAGS $LIBS $PERF_EVENT_FLAGS -o test-for-PERF_GUEST  > /dev/null 2>&1
+if test -f test-for-PERF_GUEST; then
+	echo "yes"
+	HAVE_PERF_GUEST_MACROS='1'
 else
-	HAVE_PERF_EVENTS='0'
-	AC_MSG_RESULT([No perf_events support available; falling back to legacy oprofile])
+	echo "no"
+	HAVE_PERF_GUEST_MACROS='0'
 fi
+AC_DEFINE_UNQUOTED(HAVE_PERF_GUEST_MACROS, $HAVE_PERF_GUEST_MACROS, [PERF_RECORD_MISC_GUEST_KERNEL is defined in perf_event.h])
+rm -f test-for-PERF_GUEST*
+
+AC_MSG_CHECKING([whether precise_ip is defined in perf_event.h])
+rm -f test-for-precise-ip
+AC_LANG_CONFTEST(
+	[AC_LANG_PROGRAM([[#include <linux/perf_event.h>]],
+		[[struct perf_event_attr attr;
+		attr.precise_ip = 2;]])
+	])
+$CC conftest.$ac_ext $CFLAGS $LDFLAGS $LIBS $PERF_EVENT_FLAGS -o test-for-precise-ip  > /dev/null 2>&1
+if test -f test-for-precise-ip; then
+	echo "yes"
+	HAVE_PERF_PRECISE_IP='1'
+else
+	echo "no"
+	HAVE_PERF_PRECISE_IP='0'
+fi
+AC_DEFINE_UNQUOTED(HAVE_PERF_PRECISE_IP, $HAVE_PERF_PRECISE_IP, [precise_ip is defined in perf_event.h])
+rm -f test-for-precise-ip*
+
 
 AC_DEFINE_UNQUOTED(HAVE_PERF_EVENTS, $HAVE_PERF_EVENTS, [Kernel support for perf_events exists])
-
-if test "$HAVE_PERF_EVENTS" = "1"; then
-	PFM_LIB=
-	arch="`uname -m`"
-	if test "$arch" = "ppc64" || test "$arch" = "ppc"; then
-		AC_CHECK_HEADER(perfmon/pfmlib.h,,[AC_MSG_ERROR([pfmlib.h not found; usually provided in papi devel package])])
-		AC_CHECK_LIB(pfm,pfm_get_os_event_encoding, HAVE_LIBPFM3='0'; HAVE_LIBPFM='1', [
-			AC_CHECK_LIB(pfm, pfm_get_event_name, HAVE_LIBPFM3='1'; HAVE_LIBPFM='1',
-			[AC_MSG_ERROR([libpfm not found; usually provided in papi devel package])])])
-		PFM_LIB="-lpfm"
-		AC_DEFINE_UNQUOTED(HAVE_LIBPFM3, $HAVE_LIBPFM3, [Define to 1 if using libpfm3; 0 if using newer libpfm])
-		AC_DEFINE_UNQUOTED(HAVE_LIBPFM, $HAVE_LIBPFM, [Define to 1 if libpfm is available])
-	fi
-	AC_SUBST(PFM_LIB)
+AC_CANONICAL_HOST
+PFM_LIB=
+if test "$host_cpu" = "powerpc64le" -o "$host_cpu" = "powerpc64"; then
+	AC_CHECK_HEADER(perfmon/pfmlib.h,,[AC_MSG_ERROR([pfmlib.h not found; may be provided by libpfm devel or papi devel package])])
+	AC_CHECK_LIB(pfm,pfm_get_os_event_encoding, HAVE_LIBPFM3='0'; HAVE_LIBPFM='1', [
+		AC_CHECK_LIB(pfm, pfm_get_event_name, HAVE_LIBPFM3='1'; HAVE_LIBPFM='1',
+		[AC_MSG_ERROR([libpfm not found; may be provided by libpfm devel or papi devel package])])])
+	PFM_LIB="-lpfm"
+	AC_DEFINE_UNQUOTED(HAVE_LIBPFM3, $HAVE_LIBPFM3, [Define to 1 if using libpfm3; 0 if using newer libpfm])
+	AC_DEFINE_UNQUOTED(HAVE_LIBPFM, $HAVE_LIBPFM, [Define to 1 if libpfm is available])
 fi
+AC_SUBST(PFM_LIB)
 
 AC_ARG_WITH(java,
 [  --with-java=java-home        Path to Java home directory (default is "no"; "yes" will use /usr as Java home)],
@@ -178,6 +224,8 @@ if test "x$with_java" = "xyes"; then
 	JAVA_HOMEDIR="/usr"
 else if test "x$with_java" = "xno"; then
 	JAVA_HOMEDIR=
+	else
+		JAVA_HOME_SPECIFIED="yes"
 	fi
 fi
 AC_SUBST(JAVA_HOMEDIR)
@@ -186,6 +234,15 @@ if test -n "$JAVA_HOMEDIR"; then
 	AC_CHECK_FILE("$JAVA_HOMEDIR/include/jvmti.h",JVMTI_H_EXISTS="yes",)
 	AC_CHECK_FILE("$JAVA_HOMEDIR/include/jvmpi.h",JVMPI_H_EXISTS="yes",)
 fi
+if test -n "$JAVA_HOME_SPECIFIED"  && test -z "$JVMTI_H_EXISTS" && test -z "$JVMPI_H_EXISTS"; then
+	if test -d "$JAVA_HOMEDIR"; then
+		echo "You specified the "--with-java" option, but neither jvmti.h nor jvmpi.h were found."
+	else
+		echo "You specified the "--with-java" option, but $JAVA_HOMEDIR does not exist."
+	fi
+	exit
+fi
+
 
 AM_CONDITIONAL(BUILD_JVMTI_AGENT, test -n "$JVMTI_H_EXISTS")
 AM_CONDITIONAL(BUILD_JVMPI_AGENT, test -n "$JVMPI_H_EXISTS")
@@ -214,8 +271,6 @@ LDFLAGS="$LDFLAGS_SAVE"
 AC_SUBST(OP_CPPFLAGS)
 AC_SUBST(OP_LDFLAGS)
 
-AX_CELL_SPU
-
 # C++ tests
 
 AC_LANG_CPLUSPLUS
@@ -236,68 +291,6 @@ AX_TYPEDEFED_NAME(ptrdiff_t, "int" "long", PTRDIFF_T_TYPE)
 AC_SUBST(PTRDIFF_T_TYPE)
 
 AC_PATH_XTRA
-ORIG_X_SAVE_LIBS="$LIBS"
-LIBS="$X_PRE_LIBS $LIBS $X_LIBS -lX11 $X_EXTRA_LIBS"
-X_LIBS="$LIBS"
-AC_SUBST(X_LIBS)
-
-AC_ARG_ENABLE(gui,[  --enable-gui  compile with gui component (qt3|qt4|yes|no),
-		     if not given or set to yes, gui defaults to qt3],, enable_gui=qt3)
-
-if test "x$enable_gui"  = "xqt3"  || test "x$enable_gui"  = "xyes"; then
-	QT_VERSION=3
-	QT_DO_IT_ALL
-	if test -n "$QT_LIB"; then
-		QT_LIBS="$QT_LIB $QT_LDFLAGS"
-	fi
-	QT_CFLAGS="$QT_INCLUDES"
-fi
-
-if test "x$enable_gui"  = "xqt4"; then
-	QT_VERSION=4
-	PKG_CHECK_MODULES(QT, Qt3Support QtGui QtCore ,,[
-	echo "You requested QT4 but its build files are not available. Exiting now."
-	exit
-	])
-	MOC=$(pkg-config --variable=moc_location QtCore)
-	UIC=$(dirname $(pkg-config --variable=uic_location QtCore))/uic3
-	QT_VERSION=$(pkg-config --modversion QtCore)
-
-dnl following are some sanity tests and workarounds for buggy QtCore.pc files
-	if test "x$MOC" = "x"; then
-		echo "WARNING: Your QtCore.pc file is buggy, it doesn't provide the variable 'moc_location'"
-		echo "WARNING: I will try to find it in your PATH ..."
-		AC_CHECK_PROG(MOC, moc, moc)
-		if test "x$MOC" = "x"; then
-			echo "WARNING: You can fix this by adding the location of moc to your path."
-			echo "WARNING: Exiting now."
-			exit
-		fi
-	fi
-
-	if test "x$UIC" = "x3"; then
-		echo "WARNING: Your QtCore.pc file is buggy, it doesn't provide the variable 'uic_location'"
-		echo "WARNING: I will try to find it in your PATH ..."
-		AC_CHECK_PROG(UIChelp, uic3, uic3)
-		if test "x$UIChelp" = "x"; then
-			echo "WARNING: You can fix this by adding the location of uic3 to your path."
-			echo "WARNING: Exiting now."
-			exit
-		else
-			UIC="$UIChelp"
-		fi
-	fi
-
-	flags_has_qt3support=$(echo $QT_CFLAGS | grep QT3_SUPPORT)
-	if test "x$flags_has_qt3support" = "x" ; then
-		echo "WARNING: Your Qt3Support package is buggy; it dosn't include the 'QT3_SUPPORT' flag"
-		echo "WARNING: adding it manually"
-		QT_CFLAGS="$QT_CFLAGS -DQT3_SUPPORT"
-	fi
-fi
-AM_CONDITIONAL(have_qt, test -n "$QT_LIBS")
-
-LIBS="$ORIG_X_SAVE_LIBS"
 
 dnl enable pch for c++
 AC_ARG_ENABLE(pch,
@@ -369,6 +362,12 @@ AM_CONDITIONAL(CHECK_ACCOUNT, test "x$enable_account_check" = "xyes")
 AC_SUBST(OP_CFLAGS)
 AC_SUBST(OP_CXXFLAGS)
 
+AC_CHECK_FUNC(clock_gettime, [], [
+	AC_CHECK_LIB(rt, clock_gettime, RT_LIB="-lrt",
+		AC_MSG_ERROR(Unable to find clock_gettime function; required by ocount))])
+AC_SUBST(RT_LIB)
+
+
 # fixups for config.h
 if test "$prefix" = "NONE"; then
 	my_op_prefix="$ac_default_prefix"
@@ -392,6 +391,8 @@ OP_DOCDIR=`eval echo "${my_op_prefix}/share/doc/$PACKAGE/"`
 AC_SUBST(OP_DOCDIR)
 
 AC_OUTPUT(Makefile \
+	pe_counting/Makefile \
+	libpe_utils/Makefile \
 	pe_profiling/Makefile \
 	libperf_events/Makefile \
 	m4/Makefile \
@@ -411,41 +412,29 @@ AC_OUTPUT(Makefile \
 	libregex/tests/Makefile \
 	libregex/stl.pat \
 	libregex/tests/mangled-name \
-	daemon/Makefile \
 	events/Makefile \
 	utils/Makefile \
 	doc/Makefile \
 	doc/xsl/catalog-1.xml \
 	doc/oprofile.1 \
-	doc/opcontrol.1 \
 	doc/ophelp.1 \
+	doc/op-check-perfevents.1 \
 	doc/opreport.1 \
 	doc/opannotate.1 \
 	doc/opgprof.1 \
 	doc/oparchive.1 \
 	doc/opimport.1 \
 	doc/operf.1 \
+	doc/ocount.1 \
 	doc/srcdoc/Doxyfile \
 	libpp/Makefile \
 	opjitconv/Makefile \
 	pp/Makefile \
-	gui/Makefile \
-	gui/ui/Makefile \
 	agents/Makefile \
 	agents/jvmti/Makefile \
 	agents/jvmpi/Makefile)
 
 AX_COPY_IF_CHANGE(doc/xsl/catalog-1.xml, doc/xsl/catalog.xml)
-
-if test "x$enable_gui" = "xno" ; then
-	echo "No GUI will be built as it was explicitly disabled."
-else
-	if test -z "$QT_LIBS"; then
-		echo "Warning: QT version $QT_VERSION was requested but not found. No GUI will be built."
-	else
-		echo "Building GUI with QT $QT_VERSION"
-	 fi
-fi
 
 if ! test "x$enable_account_check" = "xyes"; then
 	:
@@ -467,10 +456,3 @@ elif test "`getent passwd oprofile 2>/dev/null`" == "" || \
 		echo "         The 'oprofile' group must be the default group for the 'oprofile' user."
 	fi
 fi
-
-if  test "$PERF_EVENT_H_EXISTS" != "yes" && test "$kernel_may_have_perf_events_support" = "yes"; then
-	echo "Warning: perf_event.h not found.  Either install the kernel headers package or"
-	echo "use the --with-kernel option if you want the non-root, single application"
-	echo "profiling support provided by operf."
-fi
-

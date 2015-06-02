@@ -77,7 +77,7 @@ Output full paths instead of basenames.
 Merge any profiles separated in a --separate session.
 .br
 .TP
-.BI "--no-header"
+.BI "--no-header / -n"
 Don't output a header detailing profiling parameters.
 .br
 .TP
@@ -92,12 +92,11 @@ Reverse the sort from the default.
 .BI "--session-dir="dir_path
 Use sample database from the specified directory
 .I dir_path
-instead of the default locations. If
+instead of the default location. If
 .I --session-dir
 is not specified, then
 .B opreport
-will search for samples in
-.I <current_dir>/oprofile_data
+will search for samples in <current_dir>/oprofile_data
 first. If that directory does not exist, the standard session-dir of /var/lib/oprofile is used.
 .br
 .TP
@@ -114,10 +113,25 @@ binary image filename.
 .BI "--symbols / -l"
 List per-symbol information instead of a binary image summary.
 .br
+Usually, the total of all per-symbols samples for a given binary image
+equals the summary count for the binary image (shown by running
+.B opreport
+with no options).
+However, it's possible for some sample addresses to fall outside the range of
+any symbols for a given binary image.  In such cases, the total number of
+per-symbols samples for the binary image may be less than the summary count
+for the image. Running
+.B opreport
+with the
+.I --verbose=debug
+option will display an informational message when this difference is detected.
+This difference is typically very small and can be ignored.
+.br
 .TP
 .BI "--threshold / -t [percentage]"
 Only output data for symbols that have more than the given percentage
-of total samples.
+of total samples. For profiles using multiple events, if the threshold is reached
+for any event, then all sample data for the symbol is shown.
 .br
 .TP
 .BI "--verbose / -V [options]"
@@ -135,15 +149,9 @@ Generate XML output.
 No special environment variables are recognized by opreport.
 
 .SH FILES
-.I <current_dir>/oprofile_data/samples
-.RS 7
-Or
-.RE
-.I /var/lib/oprofile/samples/
-.LP
-.RS 7
+.TP
+.I <session_dir>/samples
 The location of the generated sample files.
-.RE
 
 .SH VERSION
 .TP

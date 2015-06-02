@@ -34,6 +34,7 @@
 #include "format_output.h"
 #include "xml_utils.h"
 #include "cverb.h"
+#include "utility.h"
 
 using namespace std;
 
@@ -88,6 +89,13 @@ bool is_jit_sample(string const & filename)
 void check_mtime(string const & file, opd_header const & header)
 {
 	u64 newmtime = op_get_mtime(file.c_str());
+
+	if (strncmp(file.c_str(), KALL_SYM_FILE, strlen(file.c_str())) == 0)
+		/* The /proc/kallsyms file isn't a real file.  It
+		 * is generated when read.  The time comparison doesn't
+		 * really apply here as we are not using a real bfd file.
+		 */
+		return;
 
 	if (newmtime == header.mtime)
 		return;
@@ -186,17 +194,15 @@ string const op_print_event(op_cpu cpu_type, u32 type, u32 um, u32 count)
 	str += string("Counted ") + event->name;
 	str += string(" events (") + event->desc + ")";
 
-	if (cpu_type != CPU_RTC) {
-		str += " with a unit mask of 0x";
+	str += " with a unit mask of 0x";
 
-		ostringstream ss;
-		ss << hex << setw(2) << setfill('0') << unsigned(um);
-		str += ss.str();
+	ostringstream ss;
+	ss << hex << setw(2) << setfill('0') << unsigned(um);
+	str += ss.str();
 
-		str += " (";
-		str += um_desc ? um_desc : "multiple flags";
-		str += ")";
-	}
+	str += " (";
+	str += um_desc ? um_desc : "multiple flags";
+	str += ")";
 
 	str += " count " + op_lexical_cast<string>(count);
 	return str;
@@ -206,7 +212,7 @@ string const op_xml_print_event(op_cpu cpu_type, u32 type, u32 um, u32 count)
 {
 	string unit_mask;
 
-	if (cpu_type == CPU_TIMER_INT || cpu_type == CPU_RTC)
+	if (cpu_type == CPU_TIMER_INT)
 		return xml_utils::get_timer_setup((size_t)count);
 
 	struct op_event * event = op_find_event(cpu_type, type, um);
@@ -218,11 +224,9 @@ string const op_xml_print_event(op_cpu cpu_type, u32 type, u32 um, u32 count)
 		}
 	}
 
-	if (cpu_type != CPU_RTC) {
-		ostringstream str_out;
-		str_out << um;
-		unit_mask = str_out.str();
-	}
+	ostringstream str_out;
+	str_out << um;
+	unit_mask = str_out.str();
 
 	return xml_utils::get_event_setup(string(event->name),
 		(size_t)count, unit_mask);

@@ -22,6 +22,7 @@
 
 #define OP_MAX_EVT_NAME_LEN 64
 #define OP_MAX_UM_NAME_LEN 64
+#define OP_MAX_UM_NAME_STR_LEN 17
 #define OP_MAX_NUM_EVENTS 512
 
 struct ip_event {
@@ -73,6 +74,13 @@ struct sample_event {
 	u64 array[];
 };
 
+struct throttle_event {
+	struct perf_event_header header;
+	u64 time;
+	u64 id;
+	u64 stream_id;
+};
+
 typedef union event_union {
 	struct perf_event_header header;
 	struct ip_event	ip;
@@ -81,7 +89,8 @@ typedef union event_union {
 	struct fork_event fork;
 	struct lost_event lost;
 	struct read_event read;
-	struct sample_event	sample;
+	struct sample_event sample;
+	struct throttle_event throttle;
 } event_t;
 
 struct mmap_data {
@@ -122,10 +131,13 @@ typedef struct operf_event {
 	unsigned long evt_um;
 	char um_name[OP_MAX_UM_NAME_LEN];
 	unsigned long count;
-	u32 counter;
 	bool no_kernel;
 	bool no_user;
 	bool no_hv;
+	bool mode_specified; /* user specified user or kernel modes */
+	bool umask_specified; /* user specified a unit mask */
+	char um_numeric_val_as_str[OP_MAX_UM_NAME_STR_LEN];
+	bool throttled;  /* set to true if the event is ever throttled */
 } operf_event_t;
 
 struct mmap_info {
